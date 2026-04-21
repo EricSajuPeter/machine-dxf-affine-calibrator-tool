@@ -1,0 +1,5 @@
+numpy
+ezdxf
+PySide6
+matplotlib
+pyinstaller

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+build/
+dist/
+
+.cursor/
+terminals/
+agent-transcripts/
+
+*.log
+*.tmp
+Thumbs.db
+Desktop.ini
