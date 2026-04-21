@@ -67,6 +67,39 @@ python -m PyInstaller --noconfirm --clean AffineCalibratorGUI.spec
 
 First build can take several minutes; the EXE is typically tens to hundreds of MB (bundles Python, PySide6, matplotlib, numpy, ezdxf).
 
+## Web App (GitHub Pages)
+
+This repository now also includes a modern, scroll-first browser app in `web/`.
+
+### Run locally
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+### Build
+
+```bash
+cd web
+npm install
+npm run build
+```
+
+### Deploy
+
+A GitHub Actions workflow at `.github/workflows/web-pages.yml` builds and deploys the `web` app to GitHub Pages on pushes to `main`.
+
+### Web app scope (current)
+
+- In-browser affine solve from matched point pairs
+- DXF upload/parsing (LINE/LWPOLYLINE/POLYLINE focus)
+- Layered comparison view (Input, Output, Distorted)
+- Compensated DXF download
+
+Processing is client-side; uploaded DXF stays on the user's machine.
+
 ## Notes
 
 - DXF processing relies on `ezdxf`.

@@ -6,6 +6,9 @@ __pycache__/
 
 build/
 dist/
+web/node_modules/
+web/dist/
+*.tsbuildinfo
 
 .cursor/
 terminals/
