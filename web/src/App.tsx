@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import Plot from "react-plotly.js";
+import type { Config, Data, Layout } from "plotly.js";
 import { applyAffine, invertAffine, solveAffine, type Affine, type Point } from "./affine";
 import { parseDxfToPaths, transformPaths, writeSimpleDxfFromPaths, type Path2D } from "./dxf";
 
@@ -47,6 +48,17 @@ export default function App() {
     if (showDistorted) t.push(...pathsToTraces(distortedPaths, "#8e44ad", "Distorted"));
     return t;
   }, [inputPaths, outputPaths, distortedPaths, showInput, showOutput, showDistorted]);
+
+  const plotData: Data[] = traces as Data[];
+  const plotLayout: Partial<Layout> = {
+    autosize: true,
+    height: 560,
+    paper_bgcolor: "white",
+    plot_bgcolor: "white",
+    xaxis: { title: { text: "X" } },
+    yaxis: { title: { text: "Y" }, scaleanchor: "x" }
+  };
+  const plotConfig: Partial<Config> = { responsive: true };
 
   const onSolve = () => {
     try {
@@ -125,10 +137,10 @@ export default function App() {
         <h2>3) Compare Viewer</h2>
         <p className="sub">Pan/zoom and inspect layer behavior. Output uses inverse affine compensation. Distorted simulates machine execution from input.</p>
         <Plot
-          data={traces as any}
-          layout={{ autosize: true, height: 560, paper_bgcolor: "white", plot_bgcolor: "white", xaxis: { title: "X" }, yaxis: { title: "Y", scaleanchor: "x" } }}
+          data={plotData}
+          layout={plotLayout}
           style={{ width: "100%" }}
-          config={{ responsive: true }}
+          config={plotConfig}
         />
       </section>
 
