@@ -9,7 +9,9 @@ export function parseDxfToPaths(content: string): Path2D[] {
   const out: Path2D[] = [];
   for (const e of doc.entities ?? []) {
     if (e.type === "LINE") {
-      out.push([{ x: e.vertices[0].x, y: e.vertices[0].y }, { x: e.vertices[1].x, y: e.vertices[1].y }]);
+      const p0 = e.start ? { x: e.start.x, y: e.start.y } : e.vertices?.[0] ? { x: e.vertices[0].x, y: e.vertices[0].y } : null;
+      const p1 = e.end ? { x: e.end.x, y: e.end.y } : e.vertices?.[1] ? { x: e.vertices[1].x, y: e.vertices[1].y } : null;
+      if (p0 && p1) out.push([p0, p1]);
     } else if (e.type === "LWPOLYLINE" || e.type === "POLYLINE") {
       const pts = (e.vertices ?? []).map((v: any) => ({ x: v.x, y: v.y }));
       if (pts.length > 1) out.push(pts);

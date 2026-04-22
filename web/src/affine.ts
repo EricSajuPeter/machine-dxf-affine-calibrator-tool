@@ -9,6 +9,16 @@ export type Affine = {
   ty: number;
 };
 
+export type AffineDiagnostics = {
+  translationX: number;
+  translationY: number;
+  rotationDeg: number;
+  scaleX: number;
+  scaleY: number;
+  shear: number;
+  rmsError: number;
+};
+
 function solveLinear6(a: number[][], b: number[]): number[] {
   const n = 6;
   for (let i = 0; i < n; i++) {
@@ -71,5 +81,39 @@ export function invertAffine(t: Affine): Affine {
     a22: ia22,
     tx: -(ia11 * t.tx + ia12 * t.ty),
     ty: -(ia21 * t.tx + ia22 * t.ty)
+  };
+}
+
+export function diagnosticsFromAffine(
+  transform: Affine,
+  ideal: Point[],
+  measured: Point[]
+): AffineDiagnostics {
+  const tx = transform.tx;
+  const ty = transform.ty;
+  const rotation = Math.atan2(transform.a21, transform.a11) * (180 / Math.PI);
+  const scaleX = Math.hypot(transform.a11, transform.a21);
+  const scaleY = Math.hypot(transform.a12, transform.a22);
+  const shear =
+    scaleX > 1e-12 ? (transform.a11 * transform.a12 + transform.a21 * transform.a22) / (scaleX * scaleX) : 0;
+
+  let sumSq = 0;
+  const n = Math.min(ideal.length, measured.length);
+  for (let i = 0; i < n; i++) {
+    const pred = applyAffine(ideal[i], transform);
+    const dx = pred.x - measured[i].x;
+    const dy = pred.y - measured[i].y;
+    sumSq += dx * dx + dy * dy;
+  }
+  const rms = n > 0 ? Math.sqrt(sumSq / n) : 0;
+
+  return {
+    translationX: tx,
+    translationY: ty,
+    rotationDeg: rotation,
+    scaleX,
+    scaleY,
+    shear,
+    rmsError: rms
   };
 }

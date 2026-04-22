@@ -71,6 +71,12 @@ First build can take several minutes; the EXE is typically tens to hundreds of M
 
 This repository now also includes a modern, scroll-first browser app in `web/`.
 
+Live website:
+
+- [https://ericsajupeter.github.io/machine-dxf-affine-calibrator-tool/](https://ericsajupeter.github.io/machine-dxf-affine-calibrator-tool/)
+
+If you only want to use the tool (without local setup), open the URL above and use the browser workflow directly.
+
 ### Run locally
 
 ```bash
@@ -95,8 +101,9 @@ A GitHub Actions workflow at `.github/workflows/web-pages.yml` builds and deploy
 
 - In-browser affine solve from matched point pairs
 - DXF upload/parsing (LINE/LWPOLYLINE/POLYLINE focus)
-- Layered comparison view (Input, Output, Distorted)
-- Compensated DXF download
+- Calibration and DXF layered comparison workflows (Ideal, Measured, Rectified, Predicted)
+- Reference-point DX/DY tools in calibration and DXF comparison views
+- Rectified DXF download
 
 Processing is client-side; uploaded DXF stays on the user's machine.
 
