@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QStatusBar,
     QStyle,
     QToolButton,
@@ -383,7 +385,7 @@ class CalibrationPlotDialog(QDialog):
     def __init__(self, main_window: "MainWindow") -> None:
         super().__init__(main_window)
         self._main = main_window
-        self.setWindowTitle("Calibration preview")
+        self.setWindowTitle("Calibration")
         self.setModal(False)
         self._adj_group: Optional[QGroupBox] = None
         self._adj_value_edits: Dict[str, Tuple[QLineEdit, str]] = {}
@@ -1980,6 +1982,7 @@ class DxfCompareDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         self._main._dxf_compare_dialog = None
+        self._main.update_dxf_preview_plot()
         super().closeEvent(event)
 
 
@@ -1996,6 +1999,10 @@ class MainWindow(QMainWindow):
         self._mpl_figure: Optional[object] = None
         self._mpl_ax: Optional[object] = None
         self._mpl_click_cid: Optional[int] = None
+        self._dxf_preview_canvas: Optional[object] = None
+        self._dxf_preview_figure: Optional[object] = None
+        self._dxf_preview_ax: Optional[object] = None
+        self._preview_stack: Optional[QStackedWidget] = None
         self._plot_dialog: Optional[CalibrationPlotDialog] = None
         self._dxf_compare_dialog: Optional[DxfCompareDialog] = None
         self._dxf_entity_catalog: List[DxfPlottedEntity] = []
@@ -2015,6 +2022,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._set_actions_enabled(False)
         self.update_shape_plot()
+        self.update_dxf_preview_plot()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -2090,37 +2098,105 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_shape_plot_group(), stretch=1)
         return column
 
-    def _build_shape_plot_group(self) -> QGroupBox:
-        group = QGroupBox("Calibration preview")
-        layout = QVBoxLayout(group)
+    def _build_shape_plot_group(self) -> QWidget:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        frame.setFrameShadow(QFrame.Shadow.Sunken)
+        root = QVBoxLayout(frame)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        header = QHBoxLayout()
+        title_lbl = QLabel("Preview")
+        tf = title_lbl.font()
+        tf.setBold(True)
+        title_lbl.setFont(tf)
+        header.addWidget(title_lbl)
+        header.addStretch(1)
+
+        self._btn_preview_calibration = QPushButton("Calibration")
+        self._btn_preview_dxf = QPushButton("DXF")
+        self._btn_preview_calibration.setCheckable(True)
+        self._btn_preview_dxf.setCheckable(True)
+        self._btn_preview_calibration.setChecked(True)
+        self._preview_mode_group = QButtonGroup(self)
+        self._preview_mode_group.setExclusive(True)
+        self._preview_mode_group.addButton(self._btn_preview_calibration, 0)
+        self._preview_mode_group.addButton(self._btn_preview_dxf, 1)
+        self._preview_mode_group.idClicked.connect(self._on_preview_mode_changed)
+        header.addWidget(self._btn_preview_calibration)
+        header.addWidget(self._btn_preview_dxf)
+        root.addLayout(header)
+
+        self._preview_stack = QStackedWidget()
+        root.addWidget(self._preview_stack, stretch=1)
+
         self._mpl_canvas = None
         self._mpl_figure = None
         self._mpl_ax = None
+        self._mpl_click_cid = None
+        self._dxf_preview_canvas = None
+        self._dxf_preview_figure = None
+        self._dxf_preview_ax = None
+
         try:
             from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
             from matplotlib.figure import Figure
 
+            cal_page = QWidget()
+            cal_layout = QVBoxLayout(cal_page)
+            cal_layout.setContentsMargins(0, 0, 0, 0)
             figure = Figure(figsize=(4.5, 4.0))
             ax = figure.add_subplot(111)
             canvas = FigureCanvasQTAgg(figure)
             canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             canvas.setMinimumHeight(220)
             canvas.setCursor(Qt.CursorShape.PointingHandCursor)
-            canvas.setToolTip("Click to open full view (zoom, pan, legend)")
-            layout.addWidget(canvas)
+            canvas.setToolTip("Click to open full calibration view (zoom, pan, legend)")
+            cal_layout.addWidget(canvas)
             self._mpl_figure = figure
             self._mpl_ax = ax
             self._mpl_canvas = canvas
             self._mpl_click_cid = canvas.mpl_connect(
                 "button_press_event", self._on_embedded_plot_click
             )
+            self._preview_stack.addWidget(cal_page)
+
+            dxf_page = QWidget()
+            dxf_layout = QVBoxLayout(dxf_page)
+            dxf_layout.setContentsMargins(0, 0, 0, 0)
+            dxf_fig = Figure(figsize=(4.5, 4.0))
+            dxf_ax = dxf_fig.add_subplot(111)
+            dxf_canvas = FigureCanvasQTAgg(dxf_fig)
+            dxf_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            dxf_canvas.setMinimumHeight(220)
+            dxf_canvas.setCursor(Qt.CursorShape.PointingHandCursor)
+            dxf_canvas.setToolTip("Click to open DXF comparison (layers, preview && select)")
+            dxf_canvas.mpl_connect("button_press_event", self._on_dxf_embedded_plot_click)
+            dxf_layout.addWidget(dxf_canvas)
+            self._dxf_preview_figure = dxf_fig
+            self._dxf_preview_ax = dxf_ax
+            self._dxf_preview_canvas = dxf_canvas
+            self._preview_stack.addWidget(dxf_page)
         except Exception as exc:
-            err = QLabel(
+            self._mpl_canvas = None
+            self._mpl_figure = None
+            self._mpl_ax = None
+            self._mpl_click_cid = None
+            self._dxf_preview_canvas = None
+            self._dxf_preview_figure = None
+            self._dxf_preview_ax = None
+            msg = (
                 f"Plot unavailable ({exc}).\nInstall matplotlib: pip install matplotlib"
             )
-            err.setWordWrap(True)
-            layout.addWidget(err)
-        return group
+            err_cal = QLabel(msg)
+            err_cal.setWordWrap(True)
+            err_dxf = QLabel(msg)
+            err_dxf.setWordWrap(True)
+            self._preview_stack.addWidget(err_cal)
+            self._preview_stack.addWidget(err_dxf)
+
+        return frame
 
     @staticmethod
     def _try_parse_pair(sx: str, sy: str) -> Optional[Point]:
@@ -2382,7 +2458,7 @@ class MainWindow(QMainWindow):
             ax.set_ylabel("")
             ax.tick_params(labelbottom=False, labelleft=False)
         else:
-            ax.set_title("Calibration preview")
+            ax.set_title("Calibration")
             ax.set_xlabel("X (ideal vs measured overlaid for comparison)")
             ax.set_ylabel("Y")
             ax.tick_params(labelbottom=True, labelleft=True)
@@ -2667,6 +2743,151 @@ class MainWindow(QMainWindow):
         self._mpl_canvas.draw_idle()
         if self._plot_dialog is not None:
             self._plot_dialog.refresh()
+
+    def _on_preview_mode_changed(self, index: int) -> None:
+        if self._preview_stack is None:
+            return
+        self._preview_stack.setCurrentIndex(index)
+        if index == 0:
+            self.update_shape_plot()
+        else:
+            self.update_dxf_preview_plot()
+
+    def _on_dxf_embedded_plot_click(self, event: object) -> None:
+        self.on_dxf_preview_clicked()
+
+    def update_dxf_preview_plot(self) -> None:
+        if (
+            self._dxf_preview_ax is None
+            or self._dxf_preview_canvas is None
+            or self._dxf_preview_figure is None
+        ):
+            return
+        ax = self._dxf_preview_ax
+        ax.clear()
+        ax.grid(True, alpha=0.35)
+        ax.set_title("")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.tick_params(labelbottom=False, labelleft=False)
+
+        raw = self.dxf_input.text().strip()
+        if not raw:
+            ax.text(
+                0.5,
+                0.5,
+                "Set Input DXF path\n(browse or type path)",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=10,
+                color="gray",
+            )
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            ax.set_aspect("equal", adjustable="box")
+            self._dxf_preview_figure.tight_layout()
+            self._dxf_preview_canvas.draw_idle()
+            return
+
+        p = Path(raw).expanduser()
+        if not p.exists():
+            ax.text(
+                0.5,
+                0.5,
+                "DXF file not found",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=10,
+                color="gray",
+            )
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            ax.set_aspect("equal", adjustable="box")
+            self._dxf_preview_figure.tight_layout()
+            self._dxf_preview_canvas.draw_idle()
+            return
+        if p.suffix.lower() != ".dxf":
+            ax.text(
+                0.5,
+                0.5,
+                "Not a .dxf file",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=10,
+                color="gray",
+            )
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            ax.set_aspect("equal", adjustable="box")
+            self._dxf_preview_figure.tight_layout()
+            self._dxf_preview_canvas.draw_idle()
+            return
+
+        try:
+            entities = extract_dxf_entities_for_plot(p)
+        except Exception as exc:
+            ax.text(
+                0.5,
+                0.5,
+                str(exc),
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=9,
+                color="gray",
+            )
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            ax.set_aspect("equal", adjustable="box")
+            self._dxf_preview_figure.tight_layout()
+            self._dxf_preview_canvas.draw_idle()
+            return
+
+        if not entities:
+            ax.text(
+                0.5,
+                0.5,
+                "No plottable entities in DXF",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=10,
+                color="gray",
+            )
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            ax.set_aspect("equal", adjustable="box")
+            self._dxf_preview_figure.tight_layout()
+            self._dxf_preview_canvas.draw_idle()
+            return
+
+        sel = self._dxf_selected_handles
+        drawn = False
+        for ent in entities:
+            path_ar = ent.path
+            if path_ar.shape[0] < 2:
+                continue
+            picked = ent.handle in sel
+            color = "#1f77b4" if picked else "#bbbbbb"
+            lw = 1.35 if picked else 0.85
+            ax.plot(
+                path_ar[:, 0],
+                path_ar[:, 1],
+                color=color,
+                linewidth=lw,
+                solid_capstyle="round",
+            )
+            drawn = True
+
+        if drawn:
+            ax.relim()
+            ax.autoscale_view()
+        ax.set_aspect("equal", adjustable="box")
+        self._dxf_preview_figure.tight_layout()
+        self._dxf_preview_canvas.draw_idle()
 
     def _reset_user_adjustments(self) -> None:
         self._adj_dtx = 0.0
@@ -3269,56 +3490,62 @@ class MainWindow(QMainWindow):
         self.update_shape_plot()
 
     def _reload_dxf_entity_catalog(self) -> None:
-        raw = self.dxf_input.text().strip()
-        if not raw:
-            self._dxf_entity_catalog = []
-            self._dxf_selected_handles.clear()
-            return
-        p = Path(raw)
-        if not p.exists() or p.suffix.lower() != ".dxf":
-            self._dxf_entity_catalog = []
-            self._dxf_selected_handles.clear()
-            return
         try:
-            self._dxf_entity_catalog = extract_dxf_entities_for_plot(p)
-        except Exception:
-            self._dxf_entity_catalog = []
-        self._dxf_selected_handles = {e.handle for e in self._dxf_entity_catalog}
+            raw = self.dxf_input.text().strip()
+            if not raw:
+                self._dxf_entity_catalog = []
+                self._dxf_selected_handles.clear()
+                return
+            p = Path(raw)
+            if not p.exists() or p.suffix.lower() != ".dxf":
+                self._dxf_entity_catalog = []
+                self._dxf_selected_handles.clear()
+                return
+            try:
+                self._dxf_entity_catalog = extract_dxf_entities_for_plot(p)
+            except Exception:
+                self._dxf_entity_catalog = []
+            self._dxf_selected_handles = {e.handle for e in self._dxf_entity_catalog}
+        finally:
+            self.update_dxf_preview_plot()
 
     def _apply_dxf_compare_data(self) -> None:
-        inp = Path(self.dxf_input.text().strip())
-        if not inp.exists() or inp.suffix.lower() != ".dxf":
-            return
         try:
-            in_paths = extract_dxf_paths_for_plot(inp)
-            entities = extract_dxf_entities_for_plot(inp)
-        except Exception as exc:
-            self._log(f"[DXF preview] {exc}")
-            return
-        self._dxf_entity_catalog = entities
-        valid = {e.handle for e in entities}
-        self._dxf_selected_handles.intersection_update(valid)
-        if valid and not self._dxf_selected_handles:
-            self._dxf_selected_handles = set(valid)
-        out = Path(self.dxf_output.text().strip())
-        out_paths: List[np.ndarray] = []
-        if out.exists() and out.suffix.lower() == ".dxf":
+            inp = Path(self.dxf_input.text().strip())
+            if not inp.exists() or inp.suffix.lower() != ".dxf":
+                return
             try:
-                out_paths = extract_dxf_paths_for_plot(out)
+                in_paths = extract_dxf_paths_for_plot(inp)
+                entities = extract_dxf_entities_for_plot(inp)
             except Exception as exc:
-                self._log(f"[DXF preview] output: {exc}")
-        distorted: List[np.ndarray] = []
-        eff = self.get_effective_forward_affine()
-        if eff is not None and in_paths:
-            distorted = _apply_affine_to_paths(in_paths, eff[0], eff[1])
-        if self._dxf_compare_dialog is None:
-            self._dxf_compare_dialog = DxfCompareDialog(self)
-        dlg = self._dxf_compare_dialog
-        dlg.set_data(in_paths, out_paths, distorted, input_entities=entities)
-        dlg.refresh()
-        dlg.showMaximized()
-        dlg.raise_()
-        dlg.activateWindow()
+                self._log(f"[DXF preview] {exc}")
+                return
+            self._dxf_entity_catalog = entities
+            valid = {e.handle for e in entities}
+            self._dxf_selected_handles.intersection_update(valid)
+            if valid and not self._dxf_selected_handles:
+                self._dxf_selected_handles = set(valid)
+            out = Path(self.dxf_output.text().strip())
+            out_paths: List[np.ndarray] = []
+            if out.exists() and out.suffix.lower() == ".dxf":
+                try:
+                    out_paths = extract_dxf_paths_for_plot(out)
+                except Exception as exc:
+                    self._log(f"[DXF preview] output: {exc}")
+            distorted: List[np.ndarray] = []
+            eff = self.get_effective_forward_affine()
+            if eff is not None and in_paths:
+                distorted = _apply_affine_to_paths(in_paths, eff[0], eff[1])
+            if self._dxf_compare_dialog is None:
+                self._dxf_compare_dialog = DxfCompareDialog(self)
+            dlg = self._dxf_compare_dialog
+            dlg.set_data(in_paths, out_paths, distorted, input_entities=entities)
+            dlg.refresh()
+            dlg.showMaximized()
+            dlg.raise_()
+            dlg.activateWindow()
+        finally:
+            self.update_dxf_preview_plot()
 
     def _on_dxf_input_editing_finished(self) -> None:
         self._reload_dxf_entity_catalog()
@@ -3520,6 +3747,7 @@ class MainWindow(QMainWindow):
         self._set_actions_enabled(False)
         self.statusBar().showMessage("Reset complete")
         self.update_shape_plot()
+        self.update_dxf_preview_plot()
         if self._plot_dialog is not None:
             self._plot_dialog.clear_dimension_state()
 
