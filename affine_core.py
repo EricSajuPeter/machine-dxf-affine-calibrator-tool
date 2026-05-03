@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -32,11 +32,42 @@ class DxfProcessStats:
     transformed_entities: int = 0
     converted_entities: int = 0
     skipped_entities: int = 0
+    """Entities skipped due to errors, unsupported geometry, or missing handle when filtering."""
+    untransformed_by_selection: int = 0
+    """When ``only_handles`` is set: entities left unchanged because their handle was not selected."""
     warnings: List[str] | None = None
 
     def __post_init__(self) -> None:
         if self.warnings is None:
             self.warnings = []
+
+
+@dataclass
+class DxfPlottedEntity:
+    """One modelspace entity reduced to a 2D polyline for preview and selection."""
+
+    handle: str
+    dxftype: str
+    path: np.ndarray
+    bbox: Tuple[float, float, float, float]
+    """(min_x, max_x, min_y, max_y) in drawing units for marquee hit tests."""
+
+
+def _axis_aligned_bbox(path: np.ndarray) -> Tuple[float, float, float, float]:
+    xs = path[:, 0]
+    ys = path[:, 1]
+    return (float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max()))
+
+
+def _entity_handle_str(entity: Any) -> str:
+    try:
+        if entity.dxf.hasattr("handle"):
+            h = entity.dxf.get("handle")
+            if h is not None and str(h).strip() != "":
+                return str(h).strip().upper()
+    except Exception:
+        pass
+    return ""
 
 
 def points_to_array(points: Sequence[Point]) -> np.ndarray:
@@ -313,15 +344,23 @@ def transform_dxf_with_compensation(
     output_path: Path,
     comp_a: np.ndarray,
     comp_t: np.ndarray,
+    only_handles: Optional[Set[str]] = None,
 ) -> DxfProcessStats:
     ezdxf = ensure_ezdxf_available()
     doc = ezdxf.readfile(str(input_path))
     msp = doc.modelspace()
     stats = DxfProcessStats()
     to_delete: List[Any] = []
+    filter_on = only_handles is not None
+    filter_set = {h.strip().upper() for h in only_handles} if filter_on and only_handles else set()
 
     for entity in list(msp):
         kind = entity.dxftype()
+        if filter_on:
+            eh = _entity_handle_str(entity)
+            if not eh or eh not in filter_set:
+                stats.untransformed_by_selection += 1
+                continue
         try:
             if kind == "LINE":
                 sx, sy = tx_point_2d((entity.dxf.start.x, entity.dxf.start.y), comp_a, comp_t)
@@ -393,7 +432,40 @@ def transform_dxf_with_compensation(
     return stats
 
 
+def extract_dxf_entities_for_plot(path: Path) -> List[DxfPlottedEntity]:
+    """Modelspace entities as 2D polylines with stable handles for GUI selection."""
+    ezdxf = ensure_ezdxf_available()
+    doc = ezdxf.readfile(str(path))
+    msp = doc.modelspace()
+    out: List[DxfPlottedEntity] = []
+    warned_no_handle = False
+    for entity in list(msp):
+        pts = approximate_entity_to_polyline(entity)
+        if len(pts) < 2:
+            continue
+        arr = np.asarray(pts, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            continue
+        handle = _entity_handle_str(entity)
+        if not handle:
+            if not warned_no_handle:
+                # Rare for normal DXF; selection cannot target these until handles exist.
+                warned_no_handle = True
+            continue
+        bbox = _axis_aligned_bbox(arr)
+        out.append(
+            DxfPlottedEntity(
+                handle=handle,
+                dxftype=str(entity.dxftype()),
+                path=arr,
+                bbox=bbox,
+            )
+        )
+    return out
+
+
 def extract_dxf_paths_for_plot(path: Path) -> List[np.ndarray]:
+    """All modelspace paths suitable for plotting (includes entities without DXF handles)."""
     ezdxf = ensure_ezdxf_available()
     doc = ezdxf.readfile(str(path))
     msp = doc.modelspace()

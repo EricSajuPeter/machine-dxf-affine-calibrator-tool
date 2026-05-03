@@ -5,6 +5,8 @@ cd /d "%~dp0"
 set "VENV_PY=.venv\Scripts\python.exe"
 set "SPEC_FILE=AffineCalibratorGUI.spec"
 set "EXE_OUT=dist\AffineCalibratorGUI.exe"
+set "BUILD_DIR=build"
+set "DIST_DIR=dist"
 
 echo ==========================================
 echo   AffineCalibratorGUI EXE Build Script
@@ -13,7 +15,12 @@ echo.
 
 if not exist ".venv" (
   echo [INFO] Creating virtual environment...
-  python -m venv .venv
+  where py >nul 2>&1
+  if %errorlevel%==0 (
+    py -m venv .venv
+  ) else (
+    python -m venv .venv
+  )
   if errorlevel 1 (
     echo [ERROR] Failed to create .venv
     exit /b 1
@@ -50,7 +57,16 @@ if errorlevel 1 (
 )
 
 echo [INFO] Building executable with PyInstaller...
-"%VENV_PY%" -m PyInstaller --noconfirm --clean "%SPEC_FILE%"
+if exist "%BUILD_DIR%" (
+  echo [INFO] Removing previous build folder...
+  rmdir /s /q "%BUILD_DIR%"
+)
+if exist "%DIST_DIR%" (
+  echo [INFO] Removing previous dist folder...
+  rmdir /s /q "%DIST_DIR%"
+)
+
+"%VENV_PY%" -m PyInstaller --noconfirm --clean --workpath "%BUILD_DIR%" --distpath "%DIST_DIR%" "%SPEC_FILE%"
 if errorlevel 1 (
   echo [ERROR] Build FAILED.
   exit /b 1
@@ -68,4 +84,6 @@ if exist "%EXE_OUT%" (
   exit /b 1
 )
 
+echo.
+echo [INFO] Done.
 endlocal

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import csv
+import math
 import sys
+from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QAction, QDoubleValidator
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -28,6 +30,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStatusBar,
+    QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
     QCheckBox,
@@ -35,12 +39,14 @@ from PySide6.QtWidgets import (
 
 from affine_core import (
     AffineResult,
+    DxfPlottedEntity,
     apply_inverse_transform,
     apply_transform,
     build_affine_result,
     build_compensation_transform,
     compose_user_adjustment,
     decompose_affine,
+    extract_dxf_entities_for_plot,
     extract_dxf_paths_for_plot,
     transform_dxf_with_compensation,
 )
@@ -48,7 +54,135 @@ from affine_core import (
 Point = Tuple[float, float]
 
 
-def _attach_plot_scroll_pan(canvas: object, ax: object, toolbar: Optional[object] = None) -> None:
+def _dist_point_to_segment_sq(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    abx, aby = bx - ax, by - ay
+    apx, apy = px - ax, py - ay
+    ab2 = abx * abx + aby * aby
+    if ab2 < 1e-18:
+        return apx * apx + apy * apy
+    t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
+    qx, qy = ax + t * abx, ay + t * aby
+    dx, dy = px - qx, py - qy
+    return dx * dx + dy * dy
+
+
+def _nearest_entity(
+    x: float, y: float, entities: List[DxfPlottedEntity], thresh_data: float
+) -> Optional[DxfPlottedEntity]:
+    best: Optional[DxfPlottedEntity] = None
+    best_d = float("inf")
+    t2 = thresh_data * thresh_data
+    for ent in entities:
+        arr = ent.path
+        if arr.shape[0] < 2:
+            continue
+        for i in range(arr.shape[0] - 1):
+            ax_, ay_ = float(arr[i, 0]), float(arr[i, 1])
+            bx, by = float(arr[i + 1, 0]), float(arr[i + 1, 1])
+            d2 = _dist_point_to_segment_sq(x, y, ax_, ay_, bx, by)
+            if d2 < best_d:
+                best_d = d2
+                best = ent
+    if best is None or best_d > t2:
+        return None
+    return best
+
+
+def _polyline_chain_endpoints(ent: DxfPlottedEntity, tol2: float) -> List[Tuple[float, float]]:
+    """Endpoints used for chain connectivity (closed polylines collapse to one junction)."""
+    arr = ent.path
+    n = int(arr.shape[0])
+    if n < 2:
+        return []
+    p0 = (float(arr[0, 0]), float(arr[0, 1]))
+    p1 = (float(arr[-1, 0]), float(arr[-1, 1]))
+    dx, dy = p0[0] - p1[0], p0[1] - p1[1]
+    if dx * dx + dy * dy <= tol2:
+        return [p0]
+    return [p0, p1]
+
+
+def _build_endpoint_chain_graph_spatial(
+    entities: List[DxfPlottedEntity], tol2: float
+) -> Dict[str, Set[str]]:
+    """
+    Adjacency when entity endpoints lie within sqrt(tol2). Spatial grid keeps this ~O(n)
+    instead of O(n^2) endpoint pairs (critical for large DXFs / dense polylines).
+    """
+    graph: Dict[str, Set[str]] = {e.handle: set() for e in entities}
+    if not entities:
+        return graph
+    tol = math.sqrt(max(tol2, 0.0))
+    cell = max(tol, 1e-12)
+    buckets: Dict[Tuple[int, int], List[Tuple[str, float, float]]] = defaultdict(list)
+
+    for ent in entities:
+        for px, py in _polyline_chain_endpoints(ent, tol2):
+            ix = int(math.floor(px / cell))
+            iy = int(math.floor(py / cell))
+            buckets[(ix, iy)].append((ent.handle, px, py))
+
+    for (ix, iy), pts in buckets.items():
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                other = buckets.get((ix + di, iy + dj))
+                if not other:
+                    continue
+                for h1, x1, y1 in pts:
+                    for h2, x2, y2 in other:
+                        if h1 == h2:
+                            continue
+                        dx, dy = x1 - x2, y1 - y2
+                        if dx * dx + dy * dy <= tol2:
+                            graph[h1].add(h2)
+                            graph[h2].add(h1)
+    return graph
+
+
+def _bbox_intersects_rect(
+    bbox: Tuple[float, float, float, float], rx0: float, rx1: float, ry0: float, ry1: float
+) -> bool:
+    minx, maxx, miny, maxy = bbox
+    sx0, sx1 = (rx0, rx1) if rx0 <= rx1 else (rx1, rx0)
+    sy0, sy1 = (ry0, ry1) if ry0 <= ry1 else (ry1, ry0)
+    if maxx < sx0 or minx > sx1 or maxy < sy0 or miny > sy1:
+        return False
+    return True
+
+
+class _CollapsibleSection(QWidget):
+    """Header row toggles visibility of a block of controls (for dense preview sidebars)."""
+
+    def __init__(self, title: str, content: QWidget, *, start_open: bool = True) -> None:
+        super().__init__()
+        self._content = content
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(4)
+        self._toggle = QToolButton()
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(start_open)
+        self._toggle.setAutoRaise(True)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow if start_open else Qt.ArrowType.RightArrow)
+        self._toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._toggle.toggled.connect(self._on_toggled)
+        root.addWidget(self._toggle)
+        root.addWidget(self._content)
+        self._content.setVisible(start_open)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._content.setVisible(checked)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+
+
+def _attach_plot_scroll_pan(
+    canvas: object,
+    ax: object,
+    toolbar: Optional[object] = None,
+    skip_pan_begin: Optional[Callable[[object], bool]] = None,
+) -> None:
     """Scroll wheel zooms around cursor; left-drag pans. For Matplotlib Qt canvas + axes."""
     # Pan uses figure pixel deltas (event.x/y), not data coords — avoids feedback jitter when
     # limits change each frame (data-space deltas were inconsistent with the new transform).
@@ -97,6 +231,8 @@ def _attach_plot_scroll_pan(canvas: object, ax: object, toolbar: Optional[object
         if getattr(event, "button", None) != 1:
             return
         if event.x is None or event.y is None:
+            return
+        if skip_pan_begin is not None and skip_pan_begin(event):
             return
         _pan["active"] = True
         _pan["last_px"] = (float(event.x), float(event.y))
@@ -265,10 +401,11 @@ class CalibrationPlotDialog(QDialog):
         left_panel = QWidget()
         left_panel.setFixedWidth(300)
         left_v = QVBoxLayout(left_panel)
-        left_v.setSpacing(10)
+        left_v.setSpacing(8)
 
-        layers_box = QGroupBox("Layers")
-        layers_l = QVBoxLayout(layers_box)
+        layers_inner = QWidget()
+        layers_l = QVBoxLayout(layers_inner)
+        layers_l.setContentsMargins(8, 4, 8, 8)
         self._chk_ideal = QCheckBox("Ideal")
         self._chk_ideal.setChecked(True)
         self._chk_ideal.setToolTip("Computer / CAD polyline (blue)")
@@ -298,14 +435,34 @@ class CalibrationPlotDialog(QDialog):
         ):
             cb.stateChanged.connect(lambda _s: self.refresh(preserve_view=True))
             layers_l.addWidget(cb)
-        left_v.addWidget(layers_box)
+        sec_layers = _CollapsibleSection("Layers", layers_inner, start_open=True)
 
         self._adj_group = self._build_adjustment_panel()
-        left_v.addWidget(self._adj_group)
-        self._reference_group = self._build_reference_panel()
-        left_v.addWidget(self._reference_group)
+        self._adj_group.setTitle("")
+        self._adj_group.setFlat(True)
+        sec_adj = _CollapsibleSection("Manual corrections (Δ on solved)", self._adj_group, start_open=True)
 
-        left_v.addStretch(1)
+        self._reference_group = self._build_reference_panel()
+        self._reference_group.setTitle("")
+        self._reference_group.setFlat(True)
+        sec_ref = _CollapsibleSection("Reference point & dimensions", self._reference_group, start_open=False)
+
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setSpacing(10)
+        scroll_layout.setContentsMargins(2, 2, 2, 2)
+        scroll_layout.addWidget(sec_layers)
+        scroll_layout.addWidget(sec_adj)
+        scroll_layout.addWidget(sec_ref)
+        scroll_layout.addStretch(1)
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        side_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        side_scroll.setWidget(scroll_content)
+        left_v.addWidget(side_scroll, stretch=1)
+
         btn_close = QPushButton("Close")
         btn_close.setToolTip("Return to normal view")
         btn_close.clicked.connect(self.close)
@@ -475,7 +632,8 @@ class CalibrationPlotDialog(QDialog):
         self._dimension_log.setReadOnly(True)
         self._dimension_log.setPlaceholderText("Dimension picks will appear here.")
         self._dimension_log.setMaximumBlockCount(400)
-        self._dimension_log.setMinimumHeight(100)
+        self._dimension_log.setMinimumHeight(72)
+        self._dimension_log.setMaximumHeight(140)
         root.addWidget(self._dimension_log)
         return box
 
@@ -700,6 +858,14 @@ class DxfCompareDialog(QDialog):
         self._hover_pick: Optional[Dict[str, Any]] = None
         self._bbox_enabled = False
         self._bbox_layer = "Input"
+        self._input_entities: List[DxfPlottedEntity] = []
+        self._has_output_paths: bool = True
+        self._press_px: Optional[Tuple[float, float]] = None
+        self._press_xy: Optional[Tuple[float, float]] = None
+        self._marquee_mode: bool = False
+        self._marquee_corner: Optional[Tuple[float, float]] = None
+        self._marquee_remove: bool = False
+        self._marquee_rect_artist: Optional[object] = None
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -708,8 +874,11 @@ class DxfCompareDialog(QDialog):
         left = QWidget()
         left.setFixedWidth(260)
         left_v = QVBoxLayout(left)
-        box = QGroupBox("Layers")
-        box_l = QVBoxLayout(box)
+        left_v.setSpacing(6)
+
+        layers_inner = QWidget()
+        layers_l = QVBoxLayout(layers_inner)
+        layers_l.setContentsMargins(8, 4, 8, 8)
         self._chk_input = QCheckBox("Input DXF")
         self._chk_input.setChecked(True)
         self._chk_output = QCheckBox("Output DXF")
@@ -720,11 +889,12 @@ class DxfCompareDialog(QDialog):
         self._chk_coords.setChecked(False)
         for cb in (self._chk_input, self._chk_output, self._chk_distorted, self._chk_coords):
             cb.stateChanged.connect(lambda _s: self.refresh(preserve_view=True))
-            box_l.addWidget(cb)
-        left_v.addWidget(box)
+            layers_l.addWidget(cb)
+        sec_layers = _CollapsibleSection("Layers", layers_inner, start_open=True)
 
-        bbox_box = QGroupBox("Bounding box")
-        bbox_l = QVBoxLayout(bbox_box)
+        bbox_inner = QWidget()
+        bbox_l = QVBoxLayout(bbox_inner)
+        bbox_l.setContentsMargins(8, 4, 8, 8)
         self._chk_bbox = QCheckBox("Show bounding box")
         self._chk_bbox.setChecked(False)
         self._chk_bbox.stateChanged.connect(self._on_bbox_controls_changed)
@@ -736,10 +906,36 @@ class DxfCompareDialog(QDialog):
         self._cmb_bbox_layer.currentIndexChanged.connect(self._on_bbox_controls_changed)
         bbox_row.addWidget(self._cmb_bbox_layer, stretch=1)
         bbox_l.addLayout(bbox_row)
-        left_v.addWidget(bbox_box)
+        sec_bbox = _CollapsibleSection("Bounding box", bbox_inner, start_open=False)
 
-        measure_box = QGroupBox("Measure")
-        measure_l = QVBoxLayout(measure_box)
+        sel_inner = QWidget()
+        sel_l = QVBoxLayout(sel_inner)
+        sel_l.setContentsMargins(8, 4, 8, 8)
+        self._lbl_selection = QLabel("0 / 0 selected")
+        sel_l.addWidget(self._lbl_selection)
+        self._btn_sel_all = QPushButton("Select all")
+        self._btn_sel_none = QPushButton("Deselect all")
+        self._btn_sel_invert = QPushButton("Invert selection")
+        self._btn_sel_all.clicked.connect(self._on_select_all)
+        self._btn_sel_none.clicked.connect(self._on_select_none)
+        self._btn_sel_invert.clicked.connect(self._on_select_invert)
+        for b in (self._btn_sel_all, self._btn_sel_none, self._btn_sel_invert):
+            sel_l.addWidget(b)
+        sel_help = QLabel(
+            "Main-window Inverse / Forward transform only the entities selected here.\n"
+            "Click: replace selection. Ctrl+click: toggle.\n"
+            "Shift+click: toggle endpoint-connected chain (off if chain already selected).\n"
+            "Shift+drag: box add. Ctrl+Shift+drag: box remove.\n"
+            "Ctrl+Shift+click (no drag): toggle one entity.\n"
+            "Wheel zoom; drag pan (Shift disables pan for box)."
+        )
+        sel_help.setWordWrap(True)
+        sel_l.addWidget(sel_help)
+        sec_sel = _CollapsibleSection("Entity selection (input)", sel_inner, start_open=True)
+
+        measure_inner = QWidget()
+        measure_l = QVBoxLayout(measure_inner)
+        measure_l.setContentsMargins(8, 4, 8, 8)
         btn_row = QHBoxLayout()
         self._btn_measure = QPushButton("Measure DX/DY")
         self._btn_measure.setCheckable(True)
@@ -753,12 +949,14 @@ class DxfCompareDialog(QDialog):
         self._measure_log.setReadOnly(True)
         self._measure_log.setPlaceholderText("Click point A then point B to measure DX/DY.")
         self._measure_log.setMaximumBlockCount(500)
-        self._measure_log.setMinimumHeight(120)
+        self._measure_log.setMinimumHeight(72)
+        self._measure_log.setMaximumHeight(150)
         measure_l.addWidget(self._measure_log)
-        left_v.addWidget(measure_box)
+        sec_measure = _CollapsibleSection("Measure", measure_inner, start_open=False)
 
-        ref_box = QGroupBox("Reference point")
-        ref_l = QVBoxLayout(ref_box)
+        ref_inner = QWidget()
+        ref_l = QVBoxLayout(ref_inner)
+        ref_l.setContentsMargins(8, 4, 8, 8)
         ref_row = QHBoxLayout()
         ref_row.addWidget(QLabel("X"))
         self._ref_x = QLineEdit()
@@ -797,11 +995,29 @@ class DxfCompareDialog(QDialog):
             "Reference dimensions will appear here."
         )
         self._dimension_log.setMaximumBlockCount(500)
-        self._dimension_log.setMinimumHeight(100)
+        self._dimension_log.setMinimumHeight(72)
+        self._dimension_log.setMaximumHeight(130)
         ref_l.addWidget(self._dimension_log)
-        left_v.addWidget(ref_box)
+        sec_ref = _CollapsibleSection("Reference point", ref_inner, start_open=False)
 
-        left_v.addStretch(1)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setSpacing(8)
+        scroll_layout.setContentsMargins(2, 2, 2, 2)
+        scroll_layout.addWidget(sec_layers)
+        scroll_layout.addWidget(sec_bbox)
+        scroll_layout.addWidget(sec_sel)
+        scroll_layout.addWidget(sec_measure)
+        scroll_layout.addWidget(sec_ref)
+        scroll_layout.addStretch(1)
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        side_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        side_scroll.setWidget(scroll_content)
+        left_v.addWidget(side_scroll, stretch=1)
+
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.close)
         left_v.addWidget(btn_close)
@@ -820,9 +1036,14 @@ class DxfCompareDialog(QDialog):
             self._toolbar = NavigationToolbar2QT(self._canvas, self)
             right_l.addWidget(self._toolbar)
             right_l.addWidget(self._canvas, stretch=1)
-            _attach_plot_scroll_pan(self._canvas, self._ax, self._toolbar)
+            self._canvas.mpl_connect("button_press_event", self._on_selection_press)
+            _attach_plot_scroll_pan(
+                self._canvas, self._ax, self._toolbar, skip_pan_begin=self._skip_pan_for_marquee
+            )
             self._canvas.mpl_connect("button_press_event", self._on_plot_click)
+            self._canvas.mpl_connect("motion_notify_event", self._on_selection_motion)
             self._canvas.mpl_connect("motion_notify_event", self._on_plot_hover)
+            self._canvas.mpl_connect("button_release_event", self._on_selection_release)
         except Exception as exc:
             self._figure = None
             self._ax = None
@@ -833,6 +1054,9 @@ class DxfCompareDialog(QDialog):
             self._cmb_bbox_layer.setEnabled(False)
             self._btn_measure.setEnabled(False)
             self._btn_clear_measure.setEnabled(False)
+            self._btn_sel_all.setEnabled(False)
+            self._btn_sel_none.setEnabled(False)
+            self._btn_sel_invert.setEnabled(False)
             right_l.addWidget(QLabel(f"Plot unavailable: {exc}"))
         outer.addWidget(right, stretch=1)
 
@@ -1034,6 +1258,293 @@ class DxfCompareDialog(QDialog):
             return None
         return best
 
+    def _draw_input_entities(self, ax: object) -> bool:
+        sel: Set[str] = self._main._dxf_selected_handles
+        drawn = False
+        first = True
+        for ent in self._input_entities:
+            arr = ent.path
+            if arr.shape[0] < 2:
+                continue
+            is_sel = ent.handle in sel
+            color = "#ff7f0e" if is_sel else "#1f77b4"
+            lw = 2.35 if is_sel else 1.15
+            ax.plot(
+                arr[:, 0],
+                arr[:, 1],
+                color=color,
+                linewidth=lw,
+                alpha=0.95,
+                label="Input DXF" if first else "_nolegend_",
+            )
+            first = False
+            drawn = True
+        return drawn
+
+    def _collect_pickables_from_entities(self, entities: List[DxfPlottedEntity]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for e_idx, ent in enumerate(entities):
+            arr = ent.path
+            for i, row in enumerate(arr):
+                out.append(
+                    {
+                        "source": "Input",
+                        "path_index": e_idx,
+                        "point_index": i,
+                        "point": (float(row[0]), float(row[1])),
+                        "label": f"Input {ent.handle} p{i+1}",
+                    }
+                )
+        return out
+
+    def _update_selection_label(self) -> None:
+        n = len(self._main._dxf_selected_handles)
+        m = len(self._input_entities)
+        self._lbl_selection.setText(f"{n} / {m} selected")
+
+    def _on_select_all(self) -> None:
+        self._main._dxf_selected_handles = {e.handle for e in self._input_entities}
+        self._update_selection_label()
+        self.refresh(preserve_view=True)
+
+    def _on_select_none(self) -> None:
+        self._main._dxf_selected_handles.clear()
+        self._update_selection_label()
+        self.refresh(preserve_view=True)
+
+    def _on_select_invert(self) -> None:
+        all_h = {e.handle for e in self._input_entities}
+        self._main._dxf_selected_handles = all_h - self._main._dxf_selected_handles
+        self._update_selection_label()
+        self.refresh(preserve_view=True)
+
+    def _entity_pick_threshold(self) -> float:
+        if self._ax is None:
+            return 1e-6
+        xlim = self._ax.get_xlim()
+        ylim = self._ax.get_ylim()
+        span = max(float(xlim[1] - xlim[0]), float(ylim[1] - ylim[0]))
+        return max(1e-9, span * 0.025)
+
+    def _model_xy_extent(self) -> float:
+        """Larger axis-aligned span of all input entities (drawing units), for tolerance caps."""
+        ents = self._input_entities
+        if not ents:
+            return 1.0
+        min_x = min(e.bbox[0] for e in ents)
+        max_x = max(e.bbox[1] for e in ents)
+        min_y = min(e.bbox[2] for e in ents)
+        max_y = max(e.bbox[3] for e in ents)
+        return max(max_x - min_x, max_y - min_y, 1e-12)
+
+    def _chain_endpoint_glue_distance(self) -> float:
+        """
+        Max distance between endpoints that counts as one chain.
+
+        Uses min(zoom-based pick radius, a tiny fraction of drawing extent). Otherwise a
+        zoomed-out view makes the pick radius enormous in data units and unrelated geometry
+        (or parallel rails like slot inner/outer) bridges into one component.
+        """
+        extent = self._model_xy_extent()
+        pick = self._entity_pick_threshold()
+        rel_cap = extent * 1e-6
+        tol = min(pick, rel_cap)
+        return max(tol, max(extent * 1e-14, 1e-15))
+
+    def _chain_connection_tol_sq(self) -> float:
+        d = self._chain_endpoint_glue_distance()
+        return d * d
+
+    def _touching_entity_graph(self) -> Dict[str, Set[str]]:
+        return _build_endpoint_chain_graph_spatial(
+            self._input_entities, self._chain_connection_tol_sq()
+        )
+
+    def _chain_handles_from(self, start_handle: str) -> Set[str]:
+        """All entity handles in the same endpoint-touching component as start_handle."""
+        graph = self._touching_entity_graph()
+        if start_handle not in graph:
+            return {start_handle}
+        seen: Set[str] = {start_handle}
+        stack = [start_handle]
+        while stack:
+            h = stack.pop()
+            for nb in graph[h]:
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        return seen
+
+    def _shift_toggle_chain(self, hit_handle: str) -> None:
+        """Shift+chain-select: add linked endpoints on first use; remove same chain if already fully selected."""
+        handles = self._main._dxf_selected_handles
+        ch = self._chain_handles_from(hit_handle)
+        if ch <= handles:
+            handles -= ch
+        else:
+            handles |= ch
+
+    def _skip_pan_for_marquee(self, event: object) -> bool:
+        if not self._input_entities:
+            return False
+        mods = QApplication.keyboardModifiers()
+        return bool(mods & Qt.ShiftModifier)
+
+    def _on_selection_press(self, event: object) -> None:
+        if self._ax is None or getattr(event, "inaxes", None) is not self._ax:
+            self._press_px = None
+            self._press_xy = None
+            self._marquee_mode = False
+            return
+        if getattr(event, "button", None) != 1:
+            return
+        if event.x is None or event.y is None:
+            return
+        self._press_px = (float(event.x), float(event.y))
+        xd = getattr(event, "xdata", None)
+        yd = getattr(event, "ydata", None)
+        self._press_xy = (float(xd), float(yd)) if xd is not None and yd is not None else None
+        mods = QApplication.keyboardModifiers()
+        shift = bool(mods & Qt.ShiftModifier)
+        self._marquee_mode = bool(shift and self._press_xy is not None and self._input_entities)
+        self._marquee_remove = bool(mods & Qt.ControlModifier) and shift
+        if self._marquee_mode and self._press_xy is not None:
+            self._marquee_corner = (self._press_xy[0], self._press_xy[1])
+            self._clear_marquee_artist()
+
+    def _on_selection_motion(self, event: object) -> None:
+        if not self._marquee_mode or self._ax is None or self._figure is None:
+            return
+        if getattr(event, "inaxes", None) is not self._ax:
+            return
+        if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
+            return
+        if self._marquee_corner is None:
+            return
+        x0, y0 = self._marquee_corner
+        x1, y1 = float(event.xdata), float(event.ydata)
+        self._clear_marquee_artist()
+        try:
+            from matplotlib.patches import Rectangle
+
+            xmin, xmax = (x0, x1) if x0 <= x1 else (x1, x0)
+            ymin, ymax = (y0, y1) if y0 <= y1 else (y1, y0)
+            rect = Rectangle(
+                (xmin, ymin),
+                max(xmax - xmin, 1e-12),
+                max(ymax - ymin, 1e-12),
+                fill=False,
+                edgecolor="#e377c2",
+                linewidth=1.4,
+                linestyle="--",
+                zorder=20,
+            )
+            self._ax.add_patch(rect)
+            self._marquee_rect_artist = rect
+            self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _clear_marquee_artist(self) -> None:
+        if self._marquee_rect_artist is not None and self._ax is not None:
+            try:
+                self._marquee_rect_artist.remove()
+            except Exception:
+                pass
+        self._marquee_rect_artist = None
+
+    def _finalize_marquee(self, x1: float, y1: float) -> None:
+        if self._marquee_corner is None:
+            return
+        x0, y0 = self._marquee_corner
+        self._clear_marquee_artist()
+        handles = self._main._dxf_selected_handles
+        for ent in self._input_entities:
+            if not _bbox_intersects_rect(ent.bbox, x0, x1, y0, y1):
+                continue
+            if self._marquee_remove:
+                handles.discard(ent.handle)
+            else:
+                handles.add(ent.handle)
+        self._marquee_mode = False
+        self._marquee_corner = None
+        self._update_selection_label()
+        self.refresh(preserve_view=True)
+
+    def _on_selection_release(self, event: object) -> None:
+        if getattr(event, "button", None) != 1:
+            return
+        if self._ax is None:
+            self._press_px = None
+            return
+        if self._marquee_mode and self._press_xy is not None:
+            xd = getattr(event, "xdata", None)
+            yd = getattr(event, "ydata", None)
+            if xd is not None and yd is not None and self._press_px is not None and event.x is not None and event.y is not None:
+                dxp = float(event.x) - self._press_px[0]
+                dyp = float(event.y) - self._press_px[1]
+                if (dxp * dxp + dyp * dyp) ** 0.5 > 4.0:
+                    self._finalize_marquee(float(xd), float(yd))
+                else:
+                    self._clear_marquee_artist()
+                    self._marquee_mode = False
+                    self._marquee_corner = None
+                    if self._input_entities and not (self._measure_mode or self._dimension_mode):
+                        hit = _nearest_entity(float(xd), float(yd), self._input_entities, self._entity_pick_threshold())
+                        if hit is not None:
+                            mods = QApplication.keyboardModifiers()
+                            if (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier):
+                                if hit.handle in self._main._dxf_selected_handles:
+                                    self._main._dxf_selected_handles.discard(hit.handle)
+                                else:
+                                    self._main._dxf_selected_handles.add(hit.handle)
+                            else:
+                                self._shift_toggle_chain(hit.handle)
+                            self._update_selection_label()
+                            self.refresh(preserve_view=True)
+            else:
+                self._clear_marquee_artist()
+                self._marquee_mode = False
+                self._marquee_corner = None
+            self._press_px = None
+            return
+        if self._measure_mode or self._dimension_mode or not self._input_entities:
+            self._press_px = None
+            return
+        if self._press_px is None or event.x is None or event.y is None:
+            return
+        dxp = float(event.x) - self._press_px[0]
+        dyp = float(event.y) - self._press_px[1]
+        if (dxp * dxp + dyp * dyp) ** 0.5 > 5.0:
+            self._press_px = None
+            return
+        xd = getattr(event, "xdata", None)
+        yd = getattr(event, "ydata", None)
+        if xd is None or yd is None:
+            self._press_px = None
+            return
+        hit = _nearest_entity(float(xd), float(yd), self._input_entities, self._entity_pick_threshold())
+        mods = QApplication.keyboardModifiers()
+        ctrl = bool(mods & Qt.ControlModifier)
+        shift = bool(mods & Qt.ShiftModifier)
+        handles = self._main._dxf_selected_handles
+        if hit is None:
+            if not ctrl and not shift:
+                handles.clear()
+        elif ctrl:
+            if hit.handle in handles:
+                handles.discard(hit.handle)
+            else:
+                handles.add(hit.handle)
+        elif shift:
+            self._shift_toggle_chain(hit.handle)
+        else:
+            handles.clear()
+            handles.add(hit.handle)
+        self._update_selection_label()
+        self.refresh(preserve_view=True)
+        self._press_px = None
+
     def _on_toggle_measure(self, checked: bool) -> None:
         self._measure_mode = checked
         self._measure_pending_point = None
@@ -1129,6 +1640,8 @@ class DxfCompareDialog(QDialog):
     def _on_plot_hover(self, event: object) -> None:
         if self._ax is None:
             return
+        if self._marquee_mode:
+            return
         active_pick_mode = self._measure_mode or (
             self._dimension_mode and self._reference_point is not None
         )
@@ -1210,15 +1723,35 @@ class DxfCompareDialog(QDialog):
         self.refresh(preserve_view=True)
 
     def set_data(
-        self, input_paths: List[np.ndarray], output_paths: List[np.ndarray], distorted_paths: List[np.ndarray]
+        self,
+        input_paths: List[np.ndarray],
+        output_paths: List[np.ndarray],
+        distorted_paths: List[np.ndarray],
+        *,
+        input_entities: Optional[List[DxfPlottedEntity]] = None,
     ) -> None:
         self._input_paths = input_paths
         self._output_paths = output_paths
         self._distorted_paths = distorted_paths
+        self._input_entities = list(input_entities or [])
+        self._has_output_paths = len(output_paths) > 0
+        if self._has_output_paths:
+            self._chk_output.setEnabled(True)
+        else:
+            self._chk_output.setChecked(False)
+            self._chk_output.setEnabled(False)
+        has_dist = len(distorted_paths) > 0
+        self._chk_distorted.setEnabled(has_dist)
+        if not has_dist:
+            self._chk_distorted.setChecked(False)
+        ents = self._input_entities
+        for b in (self._btn_sel_all, self._btn_sel_none, self._btn_sel_invert):
+            b.setEnabled(bool(ents))
         self._pickable_points.clear()
         self._hover_pick = None
         self._measure_pending_point = None
         self._on_bbox_controls_changed()
+        self._update_selection_label()
 
     def refresh(self, *, preserve_view: bool = False) -> None:
         if self._ax is None or self._canvas is None or self._figure is None:
@@ -1235,11 +1768,21 @@ class DxfCompareDialog(QDialog):
         pickables: List[Dict[str, Any]] = []
 
         if self._chk_input.isChecked():
-            any_drawn = self._draw_paths(ax, self._input_paths, color="blue", label="Input DXF") or any_drawn
-            pickables.extend(self._collect_pickables(self._input_paths, source="Input"))
-            if self._chk_coords.isChecked():
-                pts = [item["point"] for item in self._collect_pickables(self._input_paths, source="Input")]
-                self._annotate_points(ax, pts, color="blue", prefix="In")
+            if self._input_entities:
+                any_drawn = self._draw_input_entities(ax) or any_drawn
+                pickables.extend(self._collect_pickables_from_entities(self._input_entities))
+                if self._chk_coords.isChecked():
+                    pts: List[Tuple[float, float]] = []
+                    for ent in self._input_entities:
+                        for row in ent.path:
+                            pts.append((float(row[0]), float(row[1])))
+                    self._annotate_points(ax, pts, color="blue", prefix="In")
+            else:
+                any_drawn = self._draw_paths(ax, self._input_paths, color="blue", label="Input DXF") or any_drawn
+                pickables.extend(self._collect_pickables(self._input_paths, source="Input"))
+                if self._chk_coords.isChecked():
+                    pts = [item["point"] for item in self._collect_pickables(self._input_paths, source="Input")]
+                    self._annotate_points(ax, pts, color="blue", prefix="In")
         if self._chk_output.isChecked():
             any_drawn = self._draw_paths(ax, self._output_paths, color="green", label="Output DXF") or any_drawn
             pickables.extend(self._collect_pickables(self._output_paths, source="Output"))
@@ -1455,6 +1998,9 @@ class MainWindow(QMainWindow):
         self._mpl_click_cid: Optional[int] = None
         self._plot_dialog: Optional[CalibrationPlotDialog] = None
         self._dxf_compare_dialog: Optional[DxfCompareDialog] = None
+        self._dxf_entity_catalog: List[DxfPlottedEntity] = []
+        self._dxf_selected_handles: Set[str] = set()
+        self._logs: List[str] = []
         # Additive manual tweaks on top of last Solve (forward map ideal → measured).
         self._adj_dtx = 0.0
         self._adj_dty = 0.0
@@ -1464,10 +2010,45 @@ class MainWindow(QMainWindow):
         self._adj_dshear = 0.0
         # Measured-space inputs only; ideal/comp/predicted recomputed on each draw from current affine.
         self._verification_measured_points: List[Point] = []
+        self._did_fit_window_to_screen: bool = False
 
         self._build_ui()
         self._set_actions_enabled(False)
         self.update_shape_plot()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._did_fit_window_to_screen:
+            return
+        self._did_fit_window_to_screen = True
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        margin = 20
+        inner_max_w = max(400, avail.width() - margin)
+        inner_max_h = max(300, avail.height() - margin)
+        cw, ch = self.width(), self.height()
+        if cw > inner_max_w or ch > inner_max_h:
+            fw, fh = self.frameGeometry().width(), self.frameGeometry().height()
+            extra_w = max(0, fw - cw)
+            extra_h = max(0, fh - ch)
+            self.resize(
+                max(520, min(cw, inner_max_w - extra_w)),
+                max(400, min(ch, inner_max_h - extra_h)),
+            )
+        fg = self.frameGeometry()
+        dx = dy = 0
+        if fg.right() > avail.right():
+            dx -= fg.right() - avail.right()
+        if fg.bottom() > avail.bottom():
+            dy -= fg.bottom() - avail.bottom()
+        if fg.left() < avail.left():
+            dx += avail.left() - fg.left()
+        if fg.top() < avail.top():
+            dy += avail.top() - fg.top()
+        if dx or dy:
+            self.move(fg.x() + dx, fg.y() + dy)
 
     def _build_ui(self) -> None:
         container = QWidget()
@@ -1487,12 +2068,11 @@ class MainWindow(QMainWindow):
         mid_row.addWidget(self._build_rectify_group(), stretch=3)
         mid_row.addWidget(self._build_dxf_group(), stretch=2)
         root.addLayout(mid_row)
-        root.addWidget(self._build_logs_group())
         root.addLayout(self._build_button_bar())
 
         self.setCentralWidget(container)
         self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("Ready")
+        self.statusBar().hide()
         self._build_menu()
 
     def _build_menu(self) -> None:
@@ -2270,48 +2850,74 @@ class MainWindow(QMainWindow):
         return group
 
     def _build_dxf_group(self) -> QGroupBox:
-        group = QGroupBox("DXF Compensation (Ideal -> Pre-distorted DXF)")
+        group = QGroupBox("DXF (inverse compensation / forward map)")
         layout = QGridLayout(group)
 
         self.dxf_input = QLineEdit()
         self.dxf_output = QLineEdit()
+        output_path_row = QWidget()
+        output_path_layout = QHBoxLayout(output_path_row)
+        output_path_layout.setContentsMargins(0, 0, 0, 0)
+        output_path_layout.setSpacing(6)
+        output_path_layout.addWidget(self.dxf_output, stretch=1)
+        self.btn_open_dxf_output_folder = QToolButton()
+        self.btn_open_dxf_output_folder.setAutoRaise(True)
+        self.btn_open_dxf_output_folder.setToolTip("Open folder containing this output file")
+        self.btn_open_dxf_output_folder.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        )
+        self.btn_open_dxf_output_folder.clicked.connect(self.on_open_dxf_output_folder)
+        output_path_layout.addWidget(self.btn_open_dxf_output_folder)
         self.btn_browse_input = QPushButton("Browse Input")
         self.btn_browse_output = QPushButton("Browse Output")
-        self.btn_process_dxf = QPushButton("Process DXF")
+        self.btn_inverse_dxf = QPushButton("Inverse")
+        self.btn_forward_dxf = QPushButton("Forward")
         self.btn_show_dxf_compare = QPushButton("Show DXF Comparison Graph")
+        self.btn_dxf_preview = QPushButton("Preview && Select…")
+
+        inv_fwd_row = QWidget()
+        inv_fwd_layout = QHBoxLayout(inv_fwd_row)
+        inv_fwd_layout.setContentsMargins(0, 0, 0, 0)
+        inv_fwd_layout.setSpacing(8)
+        inv_fwd_layout.addWidget(self.btn_inverse_dxf)
+        inv_fwd_layout.addWidget(self.btn_forward_dxf)
 
         self.btn_browse_input.clicked.connect(self.on_browse_input_dxf)
         self.btn_browse_output.clicked.connect(self.on_browse_output_dxf)
-        self.btn_process_dxf.clicked.connect(self.on_process_dxf)
+        self.btn_inverse_dxf.clicked.connect(self.on_dxf_inverse)
+        self.btn_forward_dxf.clicked.connect(self.on_dxf_forward)
         self.btn_show_dxf_compare.clicked.connect(self.on_show_dxf_comparison)
+        self.btn_dxf_preview.clicked.connect(self.on_dxf_preview_clicked)
+        self.dxf_input.editingFinished.connect(self._on_dxf_input_editing_finished)
+        self.dxf_output.editingFinished.connect(self._on_dxf_output_editing_finished)
 
         layout.addWidget(QLabel("Input DXF:"), 0, 0)
         layout.addWidget(self.dxf_input, 0, 1)
         layout.addWidget(self.btn_browse_input, 0, 2)
-        layout.addWidget(QLabel("Output DXF:"), 1, 0)
-        layout.addWidget(self.dxf_output, 1, 1)
+        layout.addWidget(QLabel("Last output DXF:"), 1, 0)
+        layout.addWidget(output_path_row, 1, 1)
         layout.addWidget(self.btn_browse_output, 1, 2)
+        layout.addWidget(self.btn_dxf_preview, 2, 0)
         layout.addWidget(self.btn_show_dxf_compare, 2, 1)
-        layout.addWidget(self.btn_process_dxf, 2, 2)
-        return group
-
-    def _build_logs_group(self) -> QGroupBox:
-        group = QGroupBox("Logs")
-        layout = QVBoxLayout(group)
-        self.log_box = QPlainTextEdit()
-        self.log_box.setReadOnly(True)
-        layout.addWidget(self.log_box)
+        layout.addWidget(inv_fwd_row, 2, 2)
         return group
 
     def _build_button_bar(self) -> QHBoxLayout:
         bar = QHBoxLayout()
         self.btn_export = QPushButton("Export Report")
+        self.btn_logs = QPushButton("Logs")
         self.btn_reset = QPushButton("Reset")
         self.btn_export.clicked.connect(self.on_export_report)
+        self.btn_logs.clicked.connect(self.on_show_logs)
         self.btn_reset.clicked.connect(self.on_reset)
+        self.lbl_latest_log = QLabel("-")
+        self.lbl_latest_log.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_latest_log.setToolTip("Most recent log line")
         bar.addWidget(self.btn_export)
+        bar.addWidget(self.btn_logs)
         bar.addWidget(self.btn_reset)
         bar.addStretch(1)
+        bar.addWidget(self.lbl_latest_log, stretch=1)
         return bar
 
     def _set_actions_enabled(self, solved: bool) -> None:
@@ -2319,33 +2925,34 @@ class MainWindow(QMainWindow):
         self.btn_rectify_fwd.setEnabled(solved)
         self.btn_add_verification.setEnabled(solved)
         self.btn_clear_verification.setEnabled(solved)
-        self.btn_process_dxf.setEnabled(solved)
+        self.btn_inverse_dxf.setEnabled(solved)
+        self.btn_forward_dxf.setEnabled(solved)
         self.btn_show_dxf_compare.setEnabled(solved)
         self.btn_export.setEnabled(solved)
-
-    def _restore_maximized_if_needed(self, was_maximized: bool) -> None:
-        if not was_maximized:
-            return
-
-        def _force_maximized() -> None:
-            screen = self.screen()
-            if screen is None:
-                screen = QApplication.primaryScreen()
-            if screen is not None:
-                avail = screen.availableGeometry()
-                # Qt can ignore geometry updates while already maximized, so normalize first.
-                self.showNormal()
-                self.setGeometry(avail)
-            self.setWindowState(Qt.WindowNoState)
-            self.setWindowState(Qt.WindowMaximized)
-            self.showMaximized()
-
-        # Run immediately and once more after layout settles.
-        QTimer.singleShot(0, _force_maximized)
-        QTimer.singleShot(120, _force_maximized)
+        self.btn_dxf_preview.setEnabled(True)
 
     def _log(self, text: str) -> None:
-        self.log_box.appendPlainText(text)
+        lines = str(text).splitlines() or [""]
+        self._logs.extend(lines)
+        latest = lines[-1] if lines else ""
+        self.lbl_latest_log.setText(latest if latest else "-")
+
+    def on_show_logs(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Logs")
+        dlg.resize(900, 500)
+        layout = QVBoxLayout(dlg)
+        box = QPlainTextEdit()
+        box.setReadOnly(True)
+        box.setPlainText("\n".join(self._logs))
+        layout.addWidget(box, stretch=1)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(btn_close)
+        layout.addLayout(row)
+        dlg.exec()
 
     def _error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)
@@ -2399,7 +3006,6 @@ class MainWindow(QMainWindow):
         return ideal_center, ideal_pairs, measured_center, measured_pairs
 
     def on_solve_calibration(self) -> None:
-        was_maximized = self.isMaximized()
         try:
             ideal_center, ideal_pairs, measured_center, measured_pairs = self._read_calibration_points()
             result = build_affine_result(
@@ -2429,8 +3035,6 @@ class MainWindow(QMainWindow):
             self.update_shape_plot()
             if self._plot_dialog is not None:
                 self._plot_dialog.clear_dimension_state()
-        finally:
-            self._restore_maximized_if_needed(was_maximized)
 
     def _refresh_diagnostics_display(self) -> None:
         """Show effective forward map (A, t) after manual adjustments; RMS stays calibration fit."""
@@ -2467,16 +3071,13 @@ class MainWindow(QMainWindow):
         self._refresh_diagnostics_display()
 
     def on_add_pair(self) -> None:
-        was_maximized = self.isMaximized()
         card = PairCardWidget(index=len(self.pair_cards) + 1, validator=self._validator)
         card.connect_plot_updates(self.update_shape_plot)
         self.pair_cards.append(card)
         self.pairs_layout.addWidget(card)
         self.update_shape_plot()
-        self._restore_maximized_if_needed(was_maximized)
 
     def on_remove_pair(self) -> None:
-        was_maximized = self.isMaximized()
         if not self.pair_cards:
             return
         card = self.pair_cards.pop()
@@ -2485,7 +3086,6 @@ class MainWindow(QMainWindow):
         for i, existing in enumerate(self.pair_cards, start=1):
             existing.set_index(i)
         self.update_shape_plot()
-        self._restore_maximized_if_needed(was_maximized)
 
     def on_save_coordinates_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -2528,7 +3128,6 @@ class MainWindow(QMainWindow):
             self._error(f"Failed to save coordinate CSV: {exc}")
 
     def on_load_coordinates_csv(self) -> None:
-        was_maximized = self.isMaximized()
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Load Coordinate Inputs CSV",
@@ -2607,8 +3206,6 @@ class MainWindow(QMainWindow):
             self._log(f"Loaded coordinate inputs CSV: {path}")
         except Exception as exc:
             self._error(f"Failed to load coordinate CSV: {exc}")
-        finally:
-            self._restore_maximized_if_needed(was_maximized)
 
     def on_rectify_point(self) -> None:
         if self.result is None:
@@ -2671,6 +3268,68 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Verification marks cleared")
         self.update_shape_plot()
 
+    def _reload_dxf_entity_catalog(self) -> None:
+        raw = self.dxf_input.text().strip()
+        if not raw:
+            self._dxf_entity_catalog = []
+            self._dxf_selected_handles.clear()
+            return
+        p = Path(raw)
+        if not p.exists() or p.suffix.lower() != ".dxf":
+            self._dxf_entity_catalog = []
+            self._dxf_selected_handles.clear()
+            return
+        try:
+            self._dxf_entity_catalog = extract_dxf_entities_for_plot(p)
+        except Exception:
+            self._dxf_entity_catalog = []
+        self._dxf_selected_handles = {e.handle for e in self._dxf_entity_catalog}
+
+    def _apply_dxf_compare_data(self) -> None:
+        inp = Path(self.dxf_input.text().strip())
+        if not inp.exists() or inp.suffix.lower() != ".dxf":
+            return
+        try:
+            in_paths = extract_dxf_paths_for_plot(inp)
+            entities = extract_dxf_entities_for_plot(inp)
+        except Exception as exc:
+            self._log(f"[DXF preview] {exc}")
+            return
+        self._dxf_entity_catalog = entities
+        valid = {e.handle for e in entities}
+        self._dxf_selected_handles.intersection_update(valid)
+        if valid and not self._dxf_selected_handles:
+            self._dxf_selected_handles = set(valid)
+        out = Path(self.dxf_output.text().strip())
+        out_paths: List[np.ndarray] = []
+        if out.exists() and out.suffix.lower() == ".dxf":
+            try:
+                out_paths = extract_dxf_paths_for_plot(out)
+            except Exception as exc:
+                self._log(f"[DXF preview] output: {exc}")
+        distorted: List[np.ndarray] = []
+        eff = self.get_effective_forward_affine()
+        if eff is not None and in_paths:
+            distorted = _apply_affine_to_paths(in_paths, eff[0], eff[1])
+        if self._dxf_compare_dialog is None:
+            self._dxf_compare_dialog = DxfCompareDialog(self)
+        dlg = self._dxf_compare_dialog
+        dlg.set_data(in_paths, out_paths, distorted, input_entities=entities)
+        dlg.refresh()
+        dlg.showMaximized()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_dxf_input_editing_finished(self) -> None:
+        self._reload_dxf_entity_catalog()
+        self._apply_dxf_compare_data()
+
+    def _on_dxf_output_editing_finished(self) -> None:
+        self._apply_dxf_compare_data()
+
+    def on_dxf_preview_clicked(self) -> None:
+        self._apply_dxf_compare_data()
+
     def on_browse_input_dxf(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Input DXF", "", "DXF Files (*.dxf)")
         if not file_path:
@@ -2678,48 +3337,95 @@ class MainWindow(QMainWindow):
         self.dxf_input.setText(file_path)
         if not self.dxf_output.text().strip():
             in_path = Path(file_path)
-            self.dxf_output.setText(str(in_path.with_name(f"{in_path.stem}_compensated.dxf")))
+            self.dxf_output.setText(str(in_path.with_name(f"{in_path.stem}_inverted.dxf")))
+        self._reload_dxf_entity_catalog()
+        self._apply_dxf_compare_data()
 
     def on_browse_output_dxf(self) -> None:
         file_path, _ = QFileDialog.getSaveFileName(self, "Select Output DXF", "", "DXF Files (*.dxf)")
         if file_path:
             self.dxf_output.setText(file_path)
 
-    def on_process_dxf(self) -> None:
+    def on_open_dxf_output_folder(self) -> None:
+        raw = self.dxf_output.text().strip()
+        if not raw:
+            QMessageBox.information(self, "Open folder", "Set an output DXF path first.")
+            return
+        path = Path(raw).expanduser()
+        folder = path.parent if path.name else path
+        try:
+            folder = folder.resolve(strict=False)
+        except OSError:
+            QMessageBox.warning(self, "Open folder", f"Could not resolve folder for:\n{raw}")
+            return
+        if not folder.exists():
+            QMessageBox.warning(
+                self,
+                "Open folder",
+                f"This folder does not exist yet:\n{folder}",
+            )
+            return
+        url = QUrl.fromLocalFile(str(folder))
+        if not QDesktopServices.openUrl(url):
+            self._error(f"Could not open folder:\n{folder}")
+
+    def _run_dxf_export(self, *, use_inverse: bool) -> None:
         if self.result is None:
             self._error("Solve calibration first.")
             return
         try:
             input_path = Path(self.dxf_input.text().strip())
-            output_path = Path(self.dxf_output.text().strip())
             if not input_path.exists():
                 raise ValueError("Input DXF path does not exist.")
             if input_path.suffix.lower() != ".dxf":
                 raise ValueError("Input must be a .dxf file.")
-            if output_path.suffix.lower() != ".dxf":
-                raise ValueError("Output must be a .dxf file.")
+
+            suffix = "_inverted" if use_inverse else "_forwarded"
+            output_path = input_path.with_name(f"{input_path.stem}{suffix}.dxf")
 
             eff = self.get_effective_forward_affine()
             assert eff is not None
-            comp_a, comp_t = build_compensation_transform(eff[0], eff[1])
+            if use_inverse:
+                comp_a, comp_t = build_compensation_transform(eff[0], eff[1])
+            else:
+                comp_a, comp_t = np.asarray(eff[0], dtype=float), np.asarray(eff[1], dtype=float)
+            if not self._dxf_entity_catalog:
+                raise ValueError("No selectable entities in this DXF. Open preview after choosing a valid input file.")
+            if not self._dxf_selected_handles:
+                raise ValueError(
+                    "No entities selected. Open Preview && Select… and choose at least one entity."
+                )
+            only_handles = set(self._dxf_selected_handles)
             stats = transform_dxf_with_compensation(
                 input_path=input_path,
                 output_path=output_path,
                 comp_a=comp_a,
                 comp_t=comp_t,
+                only_handles=only_handles,
             )
-            self.statusBar().showMessage("DXF processing complete")
-            self._log(f"DXF output: {output_path}")
+            self.dxf_output.setText(str(output_path))
+            mode = "Inverse (pre-distort)" if use_inverse else "Forward (ideal→measured)"
+            self.statusBar().showMessage(f"DXF {mode} complete")
+            self._log(f"DXF {mode}: {output_path}")
             self._log(f"Transformed entities: {stats.transformed_entities}")
             self._log(f"Converted entities: {stats.converted_entities}")
             self._log(f"Skipped entities: {stats.skipped_entities}")
+            if stats.untransformed_by_selection:
+                self._log(f"Left unchanged (not selected): {stats.untransformed_by_selection}")
             for warning in stats.warnings[:20]:
                 self._log(f"Warning: {warning}")
             if len(stats.warnings) > 20:
                 self._log(f"... and {len(stats.warnings) - 20} additional warnings")
-            QMessageBox.information(self, "DXF Complete", f"Saved compensated DXF:\n{output_path}")
+            QMessageBox.information(self, "DXF saved", f"{mode}\n{output_path}")
+            self._apply_dxf_compare_data()
         except Exception as exc:
             self._error(str(exc))
+
+    def on_dxf_inverse(self) -> None:
+        self._run_dxf_export(use_inverse=True)
+
+    def on_dxf_forward(self) -> None:
+        self._run_dxf_export(use_inverse=False)
 
     def on_show_dxf_comparison(self) -> None:
         if self.result is None:
@@ -2727,28 +3433,11 @@ class MainWindow(QMainWindow):
             return
         try:
             input_path = Path(self.dxf_input.text().strip())
-            output_path = Path(self.dxf_output.text().strip())
             if not input_path.exists():
                 raise ValueError("Input DXF path does not exist.")
-            if not output_path.exists():
-                raise ValueError("Output DXF path does not exist.")
-            if input_path.suffix.lower() != ".dxf" or output_path.suffix.lower() != ".dxf":
-                raise ValueError("Both paths must be .dxf files.")
-
-            input_paths = extract_dxf_paths_for_plot(input_path)
-            output_paths = extract_dxf_paths_for_plot(output_path)
-            eff = self.get_effective_forward_affine()
-            assert eff is not None
-            distorted_paths = _apply_affine_to_paths(input_paths, eff[0], eff[1])
-
-            if self._dxf_compare_dialog is None:
-                self._dxf_compare_dialog = DxfCompareDialog(self)
-            dlg = self._dxf_compare_dialog
-            dlg.set_data(input_paths, output_paths, distorted_paths)
-            dlg.refresh()
-            dlg.showMaximized()
-            dlg.raise_()
-            dlg.activateWindow()
+            if input_path.suffix.lower() != ".dxf":
+                raise ValueError("Input must be a .dxf file.")
+            self._apply_dxf_compare_data()
         except Exception as exc:
             self._error(str(exc))
 
@@ -2789,7 +3478,7 @@ class MainWindow(QMainWindow):
                 f"t_eff: tx={t_eff[0]:.8f}, ty={t_eff[1]:.8f}",
                 "",
                 "Log:",
-                self.log_box.toPlainText(),
+                "\n".join(self._logs),
             ]
             Path(path).write_text("\n".join(lines), encoding="utf-8")
             self.statusBar().showMessage("Report exported")
@@ -2798,7 +3487,6 @@ class MainWindow(QMainWindow):
             self._error(str(exc))
 
     def on_reset(self) -> None:
-        was_maximized = self.isMaximized()
         self.ideal_center_x.setText("0")
         self.ideal_center_y.setText("0")
         self.measured_center_x.clear()
@@ -2817,12 +3505,15 @@ class MainWindow(QMainWindow):
         self.rect_fwd_out.setText("-")
         self.dxf_input.clear()
         self.dxf_output.clear()
+        self._dxf_entity_catalog.clear()
+        self._dxf_selected_handles.clear()
         self.lbl_matrix.setText("-")
         self.lbl_translation.setText("-")
         self.lbl_pred_center.setText("-")
         self.lbl_params.setText("-")
         self.lbl_rms.setText("-")
-        self.log_box.clear()
+        self._logs.clear()
+        self.lbl_latest_log.setText("-")
         self.result = None
         self._reset_user_adjustments()
         self._verification_measured_points.clear()
@@ -2831,7 +3522,6 @@ class MainWindow(QMainWindow):
         self.update_shape_plot()
         if self._plot_dialog is not None:
             self._plot_dialog.clear_dimension_state()
-        self._restore_maximized_if_needed(was_maximized)
 
 
 def main() -> None:
