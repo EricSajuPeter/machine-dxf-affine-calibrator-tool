@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QDoubleValidator
+from PySide6.QtGui import QDesktopServices, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPushButton,
     QPlainTextEdit,
     QScrollArea,
@@ -2081,13 +2082,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
         self.setStatusBar(QStatusBar())
         self.statusBar().hide()
-        self._build_menu()
-
-    def _build_menu(self) -> None:
-        file_menu = self.menuBar().addMenu("File")
-        action_quit = QAction("Quit", self)
-        action_quit.triggered.connect(self.close)
-        file_menu.addAction(action_quit)
 
     def _build_right_column(self) -> QWidget:
         column = QWidget()
@@ -3091,9 +3085,13 @@ class MainWindow(QMainWindow):
         output_path_layout.addWidget(self.btn_open_dxf_output_folder)
         self.btn_browse_input = QPushButton("Browse Input")
         self.btn_browse_output = QPushButton("Browse Output")
-        self.btn_inverse_dxf = QPushButton("Inverse")
-        self.btn_forward_dxf = QPushButton("Forward")
-        self.btn_show_dxf_compare = QPushButton("Show DXF Comparison Graph")
+        self.btn_inverse_dxf = QToolButton()
+        self.btn_inverse_dxf.setText("Process/Inverse")
+        self.btn_inverse_dxf.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.btn_inverse_dxf.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._menu_dxf_mode = QMenu(self.btn_inverse_dxf)
+        self._act_dxf_forward = self._menu_dxf_mode.addAction("Forward")
+        self.btn_inverse_dxf.setMenu(self._menu_dxf_mode)
         self.btn_dxf_preview = QPushButton("Preview && Select…")
 
         inv_fwd_row = QWidget()
@@ -3101,13 +3099,11 @@ class MainWindow(QMainWindow):
         inv_fwd_layout.setContentsMargins(0, 0, 0, 0)
         inv_fwd_layout.setSpacing(8)
         inv_fwd_layout.addWidget(self.btn_inverse_dxf)
-        inv_fwd_layout.addWidget(self.btn_forward_dxf)
 
         self.btn_browse_input.clicked.connect(self.on_browse_input_dxf)
         self.btn_browse_output.clicked.connect(self.on_browse_output_dxf)
         self.btn_inverse_dxf.clicked.connect(self.on_dxf_inverse)
-        self.btn_forward_dxf.clicked.connect(self.on_dxf_forward)
-        self.btn_show_dxf_compare.clicked.connect(self.on_show_dxf_comparison)
+        self._act_dxf_forward.triggered.connect(self.on_dxf_forward)
         self.btn_dxf_preview.clicked.connect(self.on_dxf_preview_clicked)
         self.dxf_input.editingFinished.connect(self._on_dxf_input_editing_finished)
         self.dxf_output.editingFinished.connect(self._on_dxf_output_editing_finished)
@@ -3119,7 +3115,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(output_path_row, 1, 1)
         layout.addWidget(self.btn_browse_output, 1, 2)
         layout.addWidget(self.btn_dxf_preview, 2, 0)
-        layout.addWidget(self.btn_show_dxf_compare, 2, 1)
         layout.addWidget(inv_fwd_row, 2, 2)
         return group
 
@@ -3147,8 +3142,6 @@ class MainWindow(QMainWindow):
         self.btn_add_verification.setEnabled(solved)
         self.btn_clear_verification.setEnabled(solved)
         self.btn_inverse_dxf.setEnabled(solved)
-        self.btn_forward_dxf.setEnabled(solved)
-        self.btn_show_dxf_compare.setEnabled(solved)
         self.btn_export.setEnabled(solved)
         self.btn_dxf_preview.setEnabled(True)
 
@@ -3509,7 +3502,7 @@ class MainWindow(QMainWindow):
         finally:
             self.update_dxf_preview_plot()
 
-    def _apply_dxf_compare_data(self) -> None:
+    def _apply_dxf_compare_data(self, *, show_dialog: bool = False) -> None:
         try:
             inp = Path(self.dxf_input.text().strip())
             if not inp.exists() or inp.suffix.lower() != ".dxf":
@@ -3536,14 +3529,19 @@ class MainWindow(QMainWindow):
             eff = self.get_effective_forward_affine()
             if eff is not None and in_paths:
                 distorted = _apply_affine_to_paths(in_paths, eff[0], eff[1])
-            if self._dxf_compare_dialog is None:
-                self._dxf_compare_dialog = DxfCompareDialog(self)
             dlg = self._dxf_compare_dialog
-            dlg.set_data(in_paths, out_paths, distorted, input_entities=entities)
-            dlg.refresh()
-            dlg.showMaximized()
-            dlg.raise_()
-            dlg.activateWindow()
+            if dlg is None and show_dialog:
+                dlg = DxfCompareDialog(self)
+                self._dxf_compare_dialog = dlg
+            if dlg is not None:
+                dlg.set_data(in_paths, out_paths, distorted, input_entities=entities)
+                if show_dialog:
+                    dlg.refresh()
+                    dlg.showMaximized()
+                    dlg.raise_()
+                    dlg.activateWindow()
+                elif dlg.isVisible():
+                    dlg.refresh()
         finally:
             self.update_dxf_preview_plot()
 
@@ -3555,7 +3553,7 @@ class MainWindow(QMainWindow):
         self._apply_dxf_compare_data()
 
     def on_dxf_preview_clicked(self) -> None:
-        self._apply_dxf_compare_data()
+        self._apply_dxf_compare_data(show_dialog=True)
 
     def on_browse_input_dxf(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Input DXF", "", "DXF Files (*.dxf)")
@@ -3653,20 +3651,6 @@ class MainWindow(QMainWindow):
 
     def on_dxf_forward(self) -> None:
         self._run_dxf_export(use_inverse=False)
-
-    def on_show_dxf_comparison(self) -> None:
-        if self.result is None:
-            self._error("Solve calibration first.")
-            return
-        try:
-            input_path = Path(self.dxf_input.text().strip())
-            if not input_path.exists():
-                raise ValueError("Input DXF path does not exist.")
-            if input_path.suffix.lower() != ".dxf":
-                raise ValueError("Input must be a .dxf file.")
-            self._apply_dxf_compare_data()
-        except Exception as exc:
-            self._error(str(exc))
 
     def on_export_report(self) -> None:
         if self.result is None:

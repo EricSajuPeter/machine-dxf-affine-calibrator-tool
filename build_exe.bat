@@ -9,6 +9,7 @@ REM
 REM  Optional environment variables:
 REM    SKIP_INSTALL=1     Skip pip install (use after deps already installed)
 REM    PIP_UPGRADE=1      Pass --upgrade when installing requirements.txt
+REM    OPEN_DIST=1        Open dist folder after successful build
 REM ============================================================================
 
 set "APP_NAME=AffineCalibratorGUI"
@@ -133,6 +134,10 @@ if exist "%EXE_OUT%" (
   echo [OK] Build complete.
   echo [OK] Output: %cd%\%EXE_OUT%
   for %%A in ("%EXE_OUT%") do echo [OK] Size: %%~zA bytes
+  if /i "%OPEN_DIST%"=="1" (
+    echo [INFO] Opening dist folder...
+    start "" "%cd%\%DIST_DIR%"
+  )
 ) else (
   echo.
   echo [WARN] Build finished but EXE not found at expected path:
