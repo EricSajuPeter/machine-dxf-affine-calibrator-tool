@@ -86,6 +86,12 @@ if errorlevel 1 (
   echo [ERROR] Syntax check failed. Fix Python errors before building.
   exit /b 1
 )
+echo [INFO] Validating runtime imports...
+"%VENV_PY%" -c "from affine_core import TpsWarpModel, build_tps_warp_from_affine_residuals; import gui_app"
+if errorlevel 1 (
+  echo [ERROR] Runtime import check failed.
+  exit /b 1
+)
 echo.
 
 REM --- Dependencies ---

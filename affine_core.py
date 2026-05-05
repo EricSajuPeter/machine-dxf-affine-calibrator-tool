@@ -53,6 +53,18 @@ class DxfPlottedEntity:
     """(min_x, max_x, min_y, max_y) in drawing units for marquee hit tests."""
 
 
+@dataclass
+class TpsWarpModel:
+    """Thin-plate spline displacement model in 2D measured space."""
+
+    control_points: np.ndarray  # (n,2)
+    w_x: np.ndarray  # (n,)
+    w_y: np.ndarray  # (n,)
+    a_x: np.ndarray  # (3,)
+    a_y: np.ndarray  # (3,)
+    reg_lambda: float = 1e-6
+
+
 def _axis_aligned_bbox(path: np.ndarray) -> Tuple[float, float, float, float]:
     xs = path[:, 0]
     ys = path[:, 1]
@@ -72,6 +84,128 @@ def _entity_handle_str(entity: Any) -> str:
 
 def points_to_array(points: Sequence[Point]) -> np.ndarray:
     return np.asarray(points, dtype=float)
+
+
+def _tps_kernel_r2logr(r2: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(r2, dtype=float)
+    mask = r2 > 1e-20
+    out[mask] = r2[mask] * np.log(np.sqrt(r2[mask]))
+    return out
+
+
+def _tps_eval_displacement(model: TpsWarpModel, points: np.ndarray) -> np.ndarray:
+    q = np.asarray(points, dtype=float)
+    if q.ndim == 1:
+        q = q.reshape(1, 2)
+    if q.shape[1] != 2:
+        raise ValueError("TPS query points must be (n,2).")
+    cp = model.control_points
+    diff = q[:, None, :] - cp[None, :, :]
+    r2 = np.sum(diff * diff, axis=2)
+    k = _tps_kernel_r2logr(r2)
+    p = np.column_stack([np.ones((q.shape[0],), dtype=float), q[:, 0], q[:, 1]])
+    dx = k @ model.w_x + p @ model.a_x
+    dy = k @ model.w_y + p @ model.a_y
+    return np.column_stack([dx, dy])
+
+
+def build_tps_warp_from_affine_residuals(
+    ideal_points: Sequence[Point],
+    measured_points: Sequence[Point],
+    a_mat: np.ndarray,
+    t_vec: np.ndarray,
+    *,
+    reg_lambda: float = 1e-6,
+) -> Optional[TpsWarpModel]:
+    src = points_to_array(ideal_points)
+    dst = points_to_array(measured_points)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 2:
+        return None
+    n = int(src.shape[0])
+    if n < 3:
+        return None
+    pred = (a_mat @ src.T).T + t_vec
+    residual = dst - pred
+    if np.linalg.matrix_rank(pred - pred.mean(axis=0)) < 2:
+        return None
+
+    cp = np.asarray(pred, dtype=float)
+    diff = cp[:, None, :] - cp[None, :, :]
+    r2 = np.sum(diff * diff, axis=2)
+    k = _tps_kernel_r2logr(r2)
+    if reg_lambda > 0:
+        k = k + np.eye(n, dtype=float) * float(reg_lambda)
+    p = np.column_stack([np.ones((n,), dtype=float), cp[:, 0], cp[:, 1]])
+    zeros = np.zeros((3, 3), dtype=float)
+    top = np.hstack([k, p])
+    bottom = np.hstack([p.T, zeros])
+    lmat = np.vstack([top, bottom])
+    rhs_x = np.concatenate([residual[:, 0], np.zeros((3,), dtype=float)])
+    rhs_y = np.concatenate([residual[:, 1], np.zeros((3,), dtype=float)])
+    try:
+        sol_x = np.linalg.solve(lmat, rhs_x)
+        sol_y = np.linalg.solve(lmat, rhs_y)
+    except np.linalg.LinAlgError:
+        return None
+    return TpsWarpModel(
+        control_points=cp,
+        w_x=sol_x[:n],
+        w_y=sol_y[:n],
+        a_x=sol_x[n:],
+        a_y=sol_y[n:],
+        reg_lambda=float(reg_lambda),
+    )
+
+
+def apply_tps_warp_in_measured_space(points: np.ndarray, model: TpsWarpModel) -> np.ndarray:
+    q = np.asarray(points, dtype=float)
+    if q.ndim == 1:
+        q = q.reshape(1, 2)
+    return q + _tps_eval_displacement(model, q)
+
+
+def apply_affine_plus_tps_forward(
+    points: np.ndarray, a_mat: np.ndarray, t_vec: np.ndarray, model: Optional[TpsWarpModel]
+) -> np.ndarray:
+    p = np.asarray(points, dtype=float)
+    if p.ndim == 1:
+        p = p.reshape(1, 2)
+    measured_aff = (a_mat @ p.T).T + t_vec
+    if model is None:
+        return measured_aff
+    return apply_tps_warp_in_measured_space(measured_aff, model)
+
+
+def apply_affine_plus_tps_inverse(
+    points: np.ndarray,
+    a_mat: np.ndarray,
+    t_vec: np.ndarray,
+    model: Optional[TpsWarpModel],
+    *,
+    max_iter: int = 24,
+    tol: float = 1e-6,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """True inverse of y = H(Ax+t), where H(m)=m+warp(m). Returns (x, success_mask)."""
+    y = np.asarray(points, dtype=float)
+    if y.ndim == 1:
+        y = y.reshape(1, 2)
+    n = int(y.shape[0])
+    if model is None:
+        x = (np.linalg.inv(a_mat) @ (y - t_vec).T).T
+        return x, np.ones((n,), dtype=bool)
+
+    m = np.asarray(y, dtype=float).copy()
+    success = np.zeros((n,), dtype=bool)
+    for _ in range(max_iter):
+        disp = _tps_eval_displacement(model, m)
+        nxt = y - disp
+        delta = np.linalg.norm(nxt - m, axis=1)
+        m = nxt
+        success = success | (delta <= tol)
+        if np.all(success):
+            break
+    x = (np.linalg.inv(a_mat) @ (m - t_vec).T).T
+    return x, success
 
 
 def solve_affine_from_pairs(

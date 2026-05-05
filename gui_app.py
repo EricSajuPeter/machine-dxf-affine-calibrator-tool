@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import sys
 from collections import defaultdict
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QSettings, Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QMenu,
     QPushButton,
+    QRadioButton,
     QPlainTextEdit,
     QScrollArea,
     QSizePolicy,
@@ -44,14 +46,18 @@ from affine_core import (
     AffineResult,
     DxfPlottedEntity,
     apply_inverse_transform,
+    apply_affine_plus_tps_forward,
+    apply_affine_plus_tps_inverse,
     apply_transform,
     build_affine_result,
     build_compensation_transform,
+    build_tps_warp_from_affine_residuals,
     compose_user_adjustment,
     decompose_affine,
     extract_dxf_entities_for_plot,
     extract_dxf_paths_for_plot,
     transform_dxf_with_compensation,
+    TpsWarpModel,
 )
 
 Point = Tuple[float, float]
@@ -396,6 +402,7 @@ class CalibrationPlotDialog(QDialog):
         self._pickable_points: List[Dict[str, Any]] = []
         self._dimension_records: List[Dict[str, Any]] = []
         self._hover_pick: Optional[Dict[str, Any]] = None
+        self._did_tight_layout = False
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -834,7 +841,9 @@ class CalibrationPlotDialog(QDialog):
                     self._toolbar.set_history_buttons()
             except Exception:
                 pass
-        self._figure.tight_layout()
+        if not self._did_tight_layout:
+            self._figure.tight_layout()
+            self._did_tight_layout = True
         self._canvas.draw_idle()
 
     def closeEvent(self, event) -> None:
@@ -862,6 +871,10 @@ class DxfCompareDialog(QDialog):
         self._bbox_enabled = False
         self._bbox_layer = "Input"
         self._input_entities: List[DxfPlottedEntity] = []
+        self._overlay_preview_layers: List[Tuple[str, List[np.ndarray]]] = []
+        self._overlay_warp_cache_sig: Optional[str] = None
+        self._overlay_warp_cache_model: Optional[TpsWarpModel] = None
+        self._overlay_warp_warned_sig: Optional[str] = None
         self._has_output_paths: bool = True
         self._press_px: Optional[Tuple[float, float]] = None
         self._press_xy: Optional[Tuple[float, float]] = None
@@ -869,6 +882,7 @@ class DxfCompareDialog(QDialog):
         self._marquee_corner: Optional[Tuple[float, float]] = None
         self._marquee_remove: bool = False
         self._marquee_rect_artist: Optional[object] = None
+        self._did_tight_layout = False
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -888,12 +902,37 @@ class DxfCompareDialog(QDialog):
         self._chk_output.setChecked(True)
         self._chk_distorted = QCheckBox("Distorted (input→machine)")
         self._chk_distorted.setChecked(True)
+        self._chk_overlay = QCheckBox("Overlay DXFs (preview only)")
+        self._chk_overlay.setChecked(True)
         self._chk_coords = QCheckBox("Coordinates")
         self._chk_coords.setChecked(False)
-        for cb in (self._chk_input, self._chk_output, self._chk_distorted, self._chk_coords):
+        for cb in (self._chk_input, self._chk_output, self._chk_distorted, self._chk_overlay, self._chk_coords):
             cb.stateChanged.connect(lambda _s: self.refresh(preserve_view=True))
             layers_l.addWidget(cb)
         sec_layers = _CollapsibleSection("Layers", layers_inner, start_open=True)
+
+        overlay_inner = QWidget()
+        overlay_l = QVBoxLayout(overlay_inner)
+        overlay_l.setContentsMargins(8, 4, 8, 8)
+        self._lbl_overlay_count = QLabel("No overlay DXFs loaded")
+        self._btn_overlay_add = QPushButton("Add overlay DXF(s)…")
+        self._btn_overlay_clear = QPushButton("Clear overlays")
+        self._btn_overlay_add.clicked.connect(self._on_add_overlay_dxf)
+        self._btn_overlay_clear.clicked.connect(self._on_clear_overlay_dxf)
+        self._rad_overlay_forward = QRadioButton("Forward error")
+        self._rad_overlay_inverse = QRadioButton("Inverse error")
+        self._rad_overlay_forward.setChecked(True)
+        self._overlay_tf_group = QButtonGroup(self)
+        self._overlay_tf_group.setExclusive(True)
+        self._overlay_tf_group.addButton(self._rad_overlay_forward, 0)
+        self._overlay_tf_group.addButton(self._rad_overlay_inverse, 1)
+        self._overlay_tf_group.idClicked.connect(lambda _i: self.refresh(preserve_view=True))
+        overlay_l.addWidget(self._lbl_overlay_count)
+        overlay_l.addWidget(self._rad_overlay_forward)
+        overlay_l.addWidget(self._rad_overlay_inverse)
+        overlay_l.addWidget(self._btn_overlay_add)
+        overlay_l.addWidget(self._btn_overlay_clear)
+        sec_overlay = _CollapsibleSection("Overlay DXFs (preview only)", overlay_inner, start_open=False)
 
         bbox_inner = QWidget()
         bbox_l = QVBoxLayout(bbox_inner)
@@ -1008,6 +1047,7 @@ class DxfCompareDialog(QDialog):
         scroll_layout.setSpacing(8)
         scroll_layout.setContentsMargins(2, 2, 2, 2)
         scroll_layout.addWidget(sec_layers)
+        scroll_layout.addWidget(sec_overlay)
         scroll_layout.addWidget(sec_bbox)
         scroll_layout.addWidget(sec_sel)
         scroll_layout.addWidget(sec_measure)
@@ -1052,7 +1092,14 @@ class DxfCompareDialog(QDialog):
             self._ax = None
             self._canvas = None
             self._toolbar = None
-            for cb in (self._chk_input, self._chk_output, self._chk_distorted, self._chk_coords, self._chk_bbox):
+            for cb in (
+                self._chk_input,
+                self._chk_output,
+                self._chk_distorted,
+                self._chk_overlay,
+                self._chk_coords,
+                self._chk_bbox,
+            ):
                 cb.setEnabled(False)
             self._cmb_bbox_layer.setEnabled(False)
             self._btn_measure.setEnabled(False)
@@ -1060,6 +1107,10 @@ class DxfCompareDialog(QDialog):
             self._btn_sel_all.setEnabled(False)
             self._btn_sel_none.setEnabled(False)
             self._btn_sel_invert.setEnabled(False)
+            self._rad_overlay_forward.setEnabled(False)
+            self._rad_overlay_inverse.setEnabled(False)
+            self._btn_overlay_add.setEnabled(False)
+            self._btn_overlay_clear.setEnabled(False)
             right_l.addWidget(QLabel(f"Plot unavailable: {exc}"))
         outer.addWidget(right, stretch=1)
 
@@ -1128,6 +1179,87 @@ class DxfCompareDialog(QDialog):
     def _on_bbox_controls_changed(self, _value: object = None) -> None:
         self._bbox_enabled = self._chk_bbox.isChecked()
         self._bbox_layer = self._cmb_bbox_layer.currentText()
+        self.refresh(preserve_view=True)
+
+    def _update_overlay_label(self) -> None:
+        n = len(self._overlay_preview_layers)
+        if n == 0:
+            self._lbl_overlay_count.setText("No overlay DXFs loaded")
+            self._btn_overlay_clear.setEnabled(False)
+            return
+        total_paths = sum(len(paths) for _name, paths in self._overlay_preview_layers)
+        self._lbl_overlay_count.setText(f"{n} file(s), {total_paths} path(s)")
+        self._btn_overlay_clear.setEnabled(True)
+
+    def _overlay_warp_signature(self) -> Optional[str]:
+        eff = self._main.get_effective_forward_affine()
+        if eff is None:
+            return None
+        ideal_pairs, measured_pairs = self._main._collect_complete_pairs()
+        if len(ideal_pairs) < 3:
+            return None
+        a_eff = np.asarray(eff[0], dtype=float)
+        t_eff = np.asarray(eff[1], dtype=float)
+        pts_i = np.asarray(ideal_pairs, dtype=float).round(9)
+        pts_m = np.asarray(measured_pairs, dtype=float).round(9)
+        payload = {
+            "a": np.asarray(a_eff, dtype=float).round(12).tolist(),
+            "t": np.asarray(t_eff, dtype=float).round(12).tolist(),
+            "ideal": pts_i.tolist(),
+            "measured": pts_m.tolist(),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    def _overlay_warp_model(self) -> Optional[TpsWarpModel]:
+        sig = self._overlay_warp_signature()
+        if sig is None:
+            self._overlay_warp_cache_sig = None
+            self._overlay_warp_cache_model = None
+            return None
+        if sig == self._overlay_warp_cache_sig:
+            return self._overlay_warp_cache_model
+        eff = self._main.get_effective_forward_affine()
+        assert eff is not None
+        ideal_pairs, measured_pairs = self._main._collect_complete_pairs()
+        model = build_tps_warp_from_affine_residuals(
+            ideal_pairs,
+            measured_pairs,
+            np.asarray(eff[0], dtype=float),
+            np.asarray(eff[1], dtype=float),
+        )
+        self._overlay_warp_cache_sig = sig
+        self._overlay_warp_cache_model = model
+        if model is None and self._overlay_warp_warned_sig != sig:
+            self._main._log("[DXF overlay] TPS warp unavailable; using affine-only overlay preview.")
+            self._overlay_warp_warned_sig = sig
+        return model
+
+    def _on_add_overlay_dxf(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "Add overlay DXF(s)", "", "DXF Files (*.dxf)")
+        if not files:
+            return
+        added = 0
+        for raw in files:
+            p = Path(raw)
+            if p.suffix.lower() != ".dxf" or not p.exists():
+                self._main._log(f"[DXF overlay] skipped invalid file: {raw}")
+                continue
+            try:
+                paths = extract_dxf_paths_for_plot(p)
+            except Exception as exc:
+                self._main._log(f"[DXF overlay] {p.name}: {exc}")
+                continue
+            self._overlay_preview_layers.append((str(p), paths))
+            added += 1
+        self._update_overlay_label()
+        if added:
+            self.refresh(preserve_view=True)
+
+    def _on_clear_overlay_dxf(self) -> None:
+        if not self._overlay_preview_layers:
+            return
+        self._overlay_preview_layers.clear()
+        self._update_overlay_label()
         self.refresh(preserve_view=True)
 
     def _get_layer_paths(self, layer_name: str) -> List[np.ndarray]:
@@ -1753,6 +1885,7 @@ class DxfCompareDialog(QDialog):
         self._pickable_points.clear()
         self._hover_pick = None
         self._measure_pending_point = None
+        self._update_overlay_label()
         self._on_bbox_controls_changed()
         self._update_selection_label()
 
@@ -1803,6 +1936,71 @@ class DxfCompareDialog(QDialog):
             if self._chk_coords.isChecked():
                 pts = [item["point"] for item in self._collect_pickables(self._distorted_paths, source="Distorted")]
                 self._annotate_points(ax, pts, color="purple", prefix="Distorted")
+        if self._chk_overlay.isChecked() and self._overlay_preview_layers:
+            eff = self._main.get_effective_forward_affine()
+            overlay_tf: Optional[Tuple[np.ndarray, np.ndarray]] = None
+            tps_model: Optional[TpsWarpModel] = None
+            warp_sig = self._overlay_warp_signature()
+            if eff is not None:
+                tps_model = self._overlay_warp_model()
+                if self._rad_overlay_inverse.isChecked():
+                    overlay_tf = build_compensation_transform(eff[0], eff[1])
+                else:
+                    overlay_tf = (np.asarray(eff[0], dtype=float), np.asarray(eff[1], dtype=float))
+            first_overlay = True
+            for _name, paths in self._overlay_preview_layers:
+                for arr in paths:
+                    if arr.shape[0] < 2:
+                        continue
+                    plot_arr = arr
+                    if overlay_tf is not None:
+                        if self._rad_overlay_inverse.isChecked():
+                            if tps_model is None:
+                                a_tf, t_tf = overlay_tf
+                                plot_arr = (a_tf @ arr.T).T + t_tf
+                            else:
+                                x_inv, ok = apply_affine_plus_tps_inverse(
+                                    arr,
+                                    np.asarray(eff[0], dtype=float),
+                                    np.asarray(eff[1], dtype=float),
+                                    tps_model,
+                                )
+                                if not np.all(ok):
+                                    a_tf, t_tf = overlay_tf
+                                    aff_inv = (a_tf @ arr.T).T + t_tf
+                                    x_inv = np.asarray(x_inv, dtype=float)
+                                    x_inv[~ok] = aff_inv[~ok]
+                                    if warp_sig is not None and self._overlay_warp_warned_sig != f"{warp_sig}:inv":
+                                        n_bad = int((~ok).sum())
+                                        self._main._log(
+                                            f"[DXF overlay] TPS inverse fallback to affine-only on {n_bad} point(s)."
+                                        )
+                                        self._overlay_warp_warned_sig = f"{warp_sig}:inv"
+                                plot_arr = x_inv
+                        else:
+                            if tps_model is None:
+                                a_tf, t_tf = overlay_tf
+                                plot_arr = (a_tf @ arr.T).T + t_tf
+                            else:
+                                plot_arr = apply_affine_plus_tps_forward(
+                                    arr,
+                                    np.asarray(eff[0], dtype=float),
+                                    np.asarray(eff[1], dtype=float),
+                                    tps_model,
+                                )
+                    ax.plot(
+                        plot_arr[:, 0],
+                        plot_arr[:, 1],
+                        color="#ff8c00",
+                        linewidth=1.05,
+                        alpha=0.78,
+                        label="Overlay (preview only)" if first_overlay else "_nolegend_",
+                    )
+                    if self._chk_coords.isChecked():
+                        ov_pts = [(float(row[0]), float(row[1])) for row in plot_arr]
+                        self._annotate_points(ax, ov_pts, color="#ff8c00", prefix="Overlay")
+                    first_overlay = False
+                    any_drawn = True
 
         if self._bbox_enabled and self._is_layer_visible(self._bbox_layer):
             bbox = self._compute_bbox_from_paths(self._get_layer_paths(self._bbox_layer))
@@ -1978,7 +2176,9 @@ class DxfCompareDialog(QDialog):
             ax.set_xlim(old_xlim)
             ax.set_ylim(old_ylim)
         ax.set_aspect("equal", adjustable="box")
-        self._figure.tight_layout()
+        if not self._did_tight_layout:
+            self._figure.tight_layout()
+            self._did_tight_layout = True
         self._canvas.draw_idle()
 
     def closeEvent(self, event) -> None:
@@ -2004,10 +2204,14 @@ class MainWindow(QMainWindow):
         self._dxf_preview_figure: Optional[object] = None
         self._dxf_preview_ax: Optional[object] = None
         self._preview_stack: Optional[QStackedWidget] = None
+        self._did_tight_layout_main_plot = False
+        self._did_tight_layout_dxf_preview = False
         self._plot_dialog: Optional[CalibrationPlotDialog] = None
         self._dxf_compare_dialog: Optional[DxfCompareDialog] = None
         self._dxf_entity_catalog: List[DxfPlottedEntity] = []
         self._dxf_selected_handles: Set[str] = set()
+        self._dxf_entity_cache: Dict[Tuple[str, int, int], List[DxfPlottedEntity]] = {}
+        self._dxf_path_cache: Dict[Tuple[str, int, int], List[np.ndarray]] = {}
         self._logs: List[str] = []
         # Additive manual tweaks on top of last Solve (forward map ideal → measured).
         self._adj_dtx = 0.0
@@ -2019,8 +2223,12 @@ class MainWindow(QMainWindow):
         # Measured-space inputs only; ideal/comp/predicted recomputed on each draw from current affine.
         self._verification_measured_points: List[Point] = []
         self._did_fit_window_to_screen: bool = False
+        self._settings = QSettings("AffineCalibratorGUI", "AffineCalibratorGUI")
+        self._coord_state_suspended = True
 
         self._build_ui()
+        self._restore_coordinate_inputs_state()
+        self._coord_state_suspended = False
         self._set_actions_enabled(False)
         self.update_shape_plot()
         self.update_dxf_preview_plot()
@@ -2733,7 +2941,9 @@ class MainWindow(QMainWindow):
         if self._mpl_ax is None or self._mpl_canvas is None or self._mpl_figure is None:
             return
         self._render_calibration_axes(self._mpl_ax, minimal=True)
-        self._mpl_figure.tight_layout()
+        if not self._did_tight_layout_main_plot:
+            self._mpl_figure.tight_layout()
+            self._did_tight_layout_main_plot = True
         self._mpl_canvas.draw_idle()
         if self._plot_dialog is not None:
             self._plot_dialog.refresh()
@@ -2780,7 +2990,9 @@ class MainWindow(QMainWindow):
             ax.set_xlim(-1, 1)
             ax.set_ylim(-1, 1)
             ax.set_aspect("equal", adjustable="box")
-            self._dxf_preview_figure.tight_layout()
+            if not self._did_tight_layout_dxf_preview:
+                self._dxf_preview_figure.tight_layout()
+                self._did_tight_layout_dxf_preview = True
             self._dxf_preview_canvas.draw_idle()
             return
 
@@ -2799,7 +3011,9 @@ class MainWindow(QMainWindow):
             ax.set_xlim(-1, 1)
             ax.set_ylim(-1, 1)
             ax.set_aspect("equal", adjustable="box")
-            self._dxf_preview_figure.tight_layout()
+            if not self._did_tight_layout_dxf_preview:
+                self._dxf_preview_figure.tight_layout()
+                self._did_tight_layout_dxf_preview = True
             self._dxf_preview_canvas.draw_idle()
             return
         if p.suffix.lower() != ".dxf":
@@ -2816,12 +3030,14 @@ class MainWindow(QMainWindow):
             ax.set_xlim(-1, 1)
             ax.set_ylim(-1, 1)
             ax.set_aspect("equal", adjustable="box")
-            self._dxf_preview_figure.tight_layout()
+            if not self._did_tight_layout_dxf_preview:
+                self._dxf_preview_figure.tight_layout()
+                self._did_tight_layout_dxf_preview = True
             self._dxf_preview_canvas.draw_idle()
             return
 
         try:
-            entities = extract_dxf_entities_for_plot(p)
+            entities = self._get_cached_dxf_entities(p)
         except Exception as exc:
             ax.text(
                 0.5,
@@ -2836,7 +3052,9 @@ class MainWindow(QMainWindow):
             ax.set_xlim(-1, 1)
             ax.set_ylim(-1, 1)
             ax.set_aspect("equal", adjustable="box")
-            self._dxf_preview_figure.tight_layout()
+            if not self._did_tight_layout_dxf_preview:
+                self._dxf_preview_figure.tight_layout()
+                self._did_tight_layout_dxf_preview = True
             self._dxf_preview_canvas.draw_idle()
             return
 
@@ -2854,7 +3072,9 @@ class MainWindow(QMainWindow):
             ax.set_xlim(-1, 1)
             ax.set_ylim(-1, 1)
             ax.set_aspect("equal", adjustable="box")
-            self._dxf_preview_figure.tight_layout()
+            if not self._did_tight_layout_dxf_preview:
+                self._dxf_preview_figure.tight_layout()
+                self._did_tight_layout_dxf_preview = True
             self._dxf_preview_canvas.draw_idle()
             return
 
@@ -2880,8 +3100,40 @@ class MainWindow(QMainWindow):
             ax.relim()
             ax.autoscale_view()
         ax.set_aspect("equal", adjustable="box")
-        self._dxf_preview_figure.tight_layout()
+        if not self._did_tight_layout_dxf_preview:
+            self._dxf_preview_figure.tight_layout()
+            self._did_tight_layout_dxf_preview = True
         self._dxf_preview_canvas.draw_idle()
+
+    def _dxf_cache_key(self, path: Path) -> Optional[Tuple[str, int, int]]:
+        try:
+            p = path.expanduser().resolve()
+            st = p.stat()
+        except Exception:
+            return None
+        return (str(p), int(st.st_mtime_ns), int(st.st_size))
+
+    def _get_cached_dxf_entities(self, path: Path) -> List[DxfPlottedEntity]:
+        key = self._dxf_cache_key(path)
+        if key is None:
+            return extract_dxf_entities_for_plot(path)
+        cached = self._dxf_entity_cache.get(key)
+        if cached is not None:
+            return cached
+        entities = extract_dxf_entities_for_plot(path)
+        self._dxf_entity_cache[key] = entities
+        return entities
+
+    def _get_cached_dxf_paths(self, path: Path) -> List[np.ndarray]:
+        key = self._dxf_cache_key(path)
+        if key is None:
+            return extract_dxf_paths_for_plot(path)
+        cached = self._dxf_path_cache.get(key)
+        if cached is not None:
+            return cached
+        paths = extract_dxf_paths_for_plot(path)
+        self._dxf_path_cache[key] = paths
+        return paths
 
     def _reset_user_adjustments(self) -> None:
         self._adj_dtx = 0.0
@@ -2925,6 +3177,10 @@ class MainWindow(QMainWindow):
         self.measured_center_y = QLineEdit()
         self.measured_center_x.setValidator(self._validator)
         self.measured_center_y.setValidator(self._validator)
+        self.measured_center_x.textChanged.connect(self.update_shape_plot)
+        self.measured_center_y.textChanged.connect(self.update_shape_plot)
+        self.measured_center_x.textChanged.connect(self._on_coordinate_inputs_changed)
+        self.measured_center_y.textChanged.connect(self._on_coordinate_inputs_changed)
 
         center_row.addWidget(QLabel("Ideal center X"))
         center_row.addWidget(self.ideal_center_x)
@@ -3284,12 +3540,81 @@ class MainWindow(QMainWindow):
             self._log(f"Residual {labels[i]}: dx={dx:.6f}, dy={dy:.6f}")
         self._refresh_diagnostics_display()
 
+    def _save_coordinate_inputs_state(self) -> None:
+        if self._coord_state_suspended:
+            return
+        pairs: List[Dict[str, str]] = []
+        for card in self.pair_cards:
+            ix, iy, mx, my = card.values()
+            pairs.append(
+                {
+                    "ideal_x": ix,
+                    "ideal_y": iy,
+                    "measured_x": mx,
+                    "measured_y": my,
+                }
+            )
+        payload = {
+            "ideal_center_x": self.ideal_center_x.text().strip(),
+            "ideal_center_y": self.ideal_center_y.text().strip(),
+            "measured_center_x": self.measured_center_x.text().strip(),
+            "measured_center_y": self.measured_center_y.text().strip(),
+            "pairs": pairs,
+        }
+        self._settings.setValue("coordinates/input_state_v1", json.dumps(payload))
+
+    def _on_coordinate_inputs_changed(self) -> None:
+        self._save_coordinate_inputs_state()
+
+    def _restore_coordinate_inputs_state(self) -> None:
+        raw = self._settings.value("coordinates/input_state_v1", "", type=str)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+
+        measured_x = str(data.get("measured_center_x", "") or "")
+        measured_y = str(data.get("measured_center_y", "") or "")
+        self.ideal_center_x.setText("0")
+        self.ideal_center_y.setText("0")
+        self.measured_center_x.setText(measured_x)
+        self.measured_center_y.setText(measured_y)
+
+        pairs_data = data.get("pairs", [])
+        if not isinstance(pairs_data, list):
+            pairs_data = []
+        while self.pair_cards:
+            card = self.pair_cards.pop()
+            self.pairs_layout.removeWidget(card)
+            card.deleteLater()
+        if not pairs_data:
+            pairs_data = [{"ideal_x": "", "ideal_y": "", "measured_x": "", "measured_y": ""} for _ in range(3)]
+        for row in pairs_data:
+            self.on_add_pair()
+            card = self.pair_cards[-1]
+            if isinstance(row, dict):
+                card.ideal_x.setText(str(row.get("ideal_x", "") or ""))
+                card.ideal_y.setText(str(row.get("ideal_y", "") or ""))
+                card.measured_x.setText(str(row.get("measured_x", "") or ""))
+                card.measured_y.setText(str(row.get("measured_y", "") or ""))
+        while len(self.pair_cards) < 3:
+            self.on_add_pair()
+
     def on_add_pair(self) -> None:
         card = PairCardWidget(index=len(self.pair_cards) + 1, validator=self._validator)
         card.connect_plot_updates(self.update_shape_plot)
+        card.ideal_x.textChanged.connect(self._on_coordinate_inputs_changed)
+        card.ideal_y.textChanged.connect(self._on_coordinate_inputs_changed)
+        card.measured_x.textChanged.connect(self._on_coordinate_inputs_changed)
+        card.measured_y.textChanged.connect(self._on_coordinate_inputs_changed)
         self.pair_cards.append(card)
         self.pairs_layout.addWidget(card)
         self.update_shape_plot()
+        self._save_coordinate_inputs_state()
 
     def on_remove_pair(self) -> None:
         if not self.pair_cards:
@@ -3300,6 +3625,7 @@ class MainWindow(QMainWindow):
         for i, existing in enumerate(self.pair_cards, start=1):
             existing.set_index(i)
         self.update_shape_plot()
+        self._save_coordinate_inputs_state()
 
     def on_save_coordinates_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -3418,6 +3744,7 @@ class MainWindow(QMainWindow):
             self.update_shape_plot()
             self.statusBar().showMessage("Coordinate CSV loaded")
             self._log(f"Loaded coordinate inputs CSV: {path}")
+            self._save_coordinate_inputs_state()
         except Exception as exc:
             self._error(f"Failed to load coordinate CSV: {exc}")
 
@@ -3495,7 +3822,7 @@ class MainWindow(QMainWindow):
                 self._dxf_selected_handles.clear()
                 return
             try:
-                self._dxf_entity_catalog = extract_dxf_entities_for_plot(p)
+                self._dxf_entity_catalog = self._get_cached_dxf_entities(p)
             except Exception:
                 self._dxf_entity_catalog = []
             self._dxf_selected_handles = {e.handle for e in self._dxf_entity_catalog}
@@ -3508,8 +3835,8 @@ class MainWindow(QMainWindow):
             if not inp.exists() or inp.suffix.lower() != ".dxf":
                 return
             try:
-                in_paths = extract_dxf_paths_for_plot(inp)
-                entities = extract_dxf_entities_for_plot(inp)
+                in_paths = self._get_cached_dxf_paths(inp)
+                entities = self._get_cached_dxf_entities(inp)
             except Exception as exc:
                 self._log(f"[DXF preview] {exc}")
                 return
@@ -3522,7 +3849,7 @@ class MainWindow(QMainWindow):
             out_paths: List[np.ndarray] = []
             if out.exists() and out.suffix.lower() == ".dxf":
                 try:
-                    out_paths = extract_dxf_paths_for_plot(out)
+                    out_paths = self._get_cached_dxf_paths(out)
                 except Exception as exc:
                     self._log(f"[DXF preview] output: {exc}")
             distorted: List[np.ndarray] = []
@@ -3732,6 +4059,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Reset complete")
         self.update_shape_plot()
         self.update_dxf_preview_plot()
+        self._save_coordinate_inputs_state()
         if self._plot_dialog is not None:
             self._plot_dialog.clear_dimension_state()
 
