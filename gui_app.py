@@ -871,6 +871,10 @@ class DxfCompareDialog(QDialog):
         self._bbox_enabled = False
         self._bbox_layer = "Input"
         self._input_entities: List[DxfPlottedEntity] = []
+        self._output_paths: List[np.ndarray] = []
+        self._output_inverse_paths: List[np.ndarray] = []
+        self._output_forward_paths: List[np.ndarray] = []
+        self._output_mode_inverse: bool = True
         self._overlay_preview_layers: List[Tuple[str, List[np.ndarray]]] = []
         self._overlay_warp_cache_sig: Optional[str] = None
         self._overlay_warp_cache_model: Optional[TpsWarpModel] = None
@@ -898,15 +902,23 @@ class DxfCompareDialog(QDialog):
         layers_l.setContentsMargins(8, 4, 8, 8)
         self._chk_input = QCheckBox("Input DXF")
         self._chk_input.setChecked(True)
+        output_row = QHBoxLayout()
         self._chk_output = QCheckBox("Output DXF")
         self._chk_output.setChecked(True)
+        self._btn_output_mode = QPushButton("Inverse")
+        self._btn_output_mode.setToolTip("Toggle output preview mode: Inverse / Forward")
+        self._btn_output_mode.clicked.connect(self._on_toggle_output_mode)
+        output_row.addWidget(self._chk_output)
+        output_row.addStretch(1)
+        output_row.addWidget(self._btn_output_mode)
+        layers_l.addLayout(output_row)
         self._chk_distorted = QCheckBox("Distorted (input→machine)")
         self._chk_distorted.setChecked(True)
         self._chk_overlay = QCheckBox("Overlay DXFs (preview only)")
         self._chk_overlay.setChecked(True)
         self._chk_coords = QCheckBox("Coordinates")
         self._chk_coords.setChecked(False)
-        for cb in (self._chk_input, self._chk_output, self._chk_distorted, self._chk_overlay, self._chk_coords):
+        for cb in (self._chk_input, self._chk_distorted, self._chk_overlay, self._chk_coords):
             cb.stateChanged.connect(lambda _s: self.refresh(preserve_view=True))
             layers_l.addWidget(cb)
         sec_layers = _CollapsibleSection("Layers", layers_inner, start_open=True)
@@ -1107,6 +1119,7 @@ class DxfCompareDialog(QDialog):
             self._btn_sel_all.setEnabled(False)
             self._btn_sel_none.setEnabled(False)
             self._btn_sel_invert.setEnabled(False)
+            self._btn_output_mode.setEnabled(False)
             self._rad_overlay_forward.setEnabled(False)
             self._rad_overlay_inverse.setEnabled(False)
             self._btn_overlay_add.setEnabled(False)
@@ -1179,6 +1192,17 @@ class DxfCompareDialog(QDialog):
     def _on_bbox_controls_changed(self, _value: object = None) -> None:
         self._bbox_enabled = self._chk_bbox.isChecked()
         self._bbox_layer = self._cmb_bbox_layer.currentText()
+        self.refresh(preserve_view=True)
+
+    def _refresh_output_mode_button_text(self) -> None:
+        self._btn_output_mode.setText("Inverse" if self._output_mode_inverse else "Forward")
+
+    def _on_toggle_output_mode(self) -> None:
+        self._output_mode_inverse = not self._output_mode_inverse
+        self._refresh_output_mode_button_text()
+        self._output_paths = (
+            self._output_inverse_paths if self._output_mode_inverse else self._output_forward_paths
+        )
         self.refresh(preserve_view=True)
 
     def _update_overlay_label(self) -> None:
@@ -1860,21 +1884,29 @@ class DxfCompareDialog(QDialog):
     def set_data(
         self,
         input_paths: List[np.ndarray],
-        output_paths: List[np.ndarray],
+        output_inverse_paths: List[np.ndarray],
+        output_forward_paths: List[np.ndarray],
         distorted_paths: List[np.ndarray],
         *,
         input_entities: Optional[List[DxfPlottedEntity]] = None,
     ) -> None:
         self._input_paths = input_paths
-        self._output_paths = output_paths
+        self._output_inverse_paths = output_inverse_paths
+        self._output_forward_paths = output_forward_paths
+        self._output_paths = (
+            self._output_inverse_paths if self._output_mode_inverse else self._output_forward_paths
+        )
+        self._refresh_output_mode_button_text()
         self._distorted_paths = distorted_paths
         self._input_entities = list(input_entities or [])
-        self._has_output_paths = len(output_paths) > 0
+        self._has_output_paths = bool(self._output_inverse_paths or self._output_forward_paths)
         if self._has_output_paths:
             self._chk_output.setEnabled(True)
+            self._btn_output_mode.setEnabled(True)
         else:
             self._chk_output.setChecked(False)
             self._chk_output.setEnabled(False)
+            self._btn_output_mode.setEnabled(False)
         has_dist = len(distorted_paths) > 0
         self._chk_distorted.setEnabled(has_dist)
         if not has_dist:
@@ -1941,9 +1973,10 @@ class DxfCompareDialog(QDialog):
             overlay_tf: Optional[Tuple[np.ndarray, np.ndarray]] = None
             tps_model: Optional[TpsWarpModel] = None
             warp_sig = self._overlay_warp_signature()
+            apply_inverse = self._rad_overlay_forward.isChecked()
             if eff is not None:
                 tps_model = self._overlay_warp_model()
-                if self._rad_overlay_inverse.isChecked():
+                if apply_inverse:
                     overlay_tf = build_compensation_transform(eff[0], eff[1])
                 else:
                     overlay_tf = (np.asarray(eff[0], dtype=float), np.asarray(eff[1], dtype=float))
@@ -1954,7 +1987,7 @@ class DxfCompareDialog(QDialog):
                         continue
                     plot_arr = arr
                     if overlay_tf is not None:
-                        if self._rad_overlay_inverse.isChecked():
+                        if apply_inverse:
                             if tps_model is None:
                                 a_tf, t_tf = overlay_tf
                                 plot_arr = (a_tf @ arr.T).T + t_tf
@@ -2213,6 +2246,7 @@ class MainWindow(QMainWindow):
         self._dxf_entity_cache: Dict[Tuple[str, int, int], List[DxfPlottedEntity]] = {}
         self._dxf_path_cache: Dict[Tuple[str, int, int], List[np.ndarray]] = {}
         self._logs: List[str] = []
+        self._dxf_process_use_inverse: bool = True
         # Additive manual tweaks on top of last Solve (forward map ideal → measured).
         self._adj_dtx = 0.0
         self._adj_dty = 0.0
@@ -3342,12 +3376,12 @@ class MainWindow(QMainWindow):
         self.btn_browse_input = QPushButton("Browse Input")
         self.btn_browse_output = QPushButton("Browse Output")
         self.btn_inverse_dxf = QToolButton()
-        self.btn_inverse_dxf.setText("Process/Inverse")
         self.btn_inverse_dxf.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.btn_inverse_dxf.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self._menu_dxf_mode = QMenu(self.btn_inverse_dxf)
-        self._act_dxf_forward = self._menu_dxf_mode.addAction("Forward")
+        self._act_dxf_toggle_mode = self._menu_dxf_mode.addAction("")
         self.btn_inverse_dxf.setMenu(self._menu_dxf_mode)
+        self._sync_dxf_process_button_mode()
         self.btn_dxf_preview = QPushButton("Preview && Select…")
 
         inv_fwd_row = QWidget()
@@ -3358,8 +3392,8 @@ class MainWindow(QMainWindow):
 
         self.btn_browse_input.clicked.connect(self.on_browse_input_dxf)
         self.btn_browse_output.clicked.connect(self.on_browse_output_dxf)
-        self.btn_inverse_dxf.clicked.connect(self.on_dxf_inverse)
-        self._act_dxf_forward.triggered.connect(self.on_dxf_forward)
+        self.btn_inverse_dxf.clicked.connect(self.on_dxf_process_armed)
+        self._act_dxf_toggle_mode.triggered.connect(self._on_toggle_dxf_process_mode)
         self.btn_dxf_preview.clicked.connect(self.on_dxf_preview_clicked)
         self.dxf_input.editingFinished.connect(self._on_dxf_input_editing_finished)
         self.dxf_output.editingFinished.connect(self._on_dxf_output_editing_finished)
@@ -3845,23 +3879,27 @@ class MainWindow(QMainWindow):
             self._dxf_selected_handles.intersection_update(valid)
             if valid and not self._dxf_selected_handles:
                 self._dxf_selected_handles = set(valid)
-            out = Path(self.dxf_output.text().strip())
-            out_paths: List[np.ndarray] = []
-            if out.exists() and out.suffix.lower() == ".dxf":
-                try:
-                    out_paths = self._get_cached_dxf_paths(out)
-                except Exception as exc:
-                    self._log(f"[DXF preview] output: {exc}")
+            out_inverse_paths: List[np.ndarray] = []
+            out_forward_paths: List[np.ndarray] = []
             distorted: List[np.ndarray] = []
             eff = self.get_effective_forward_affine()
             if eff is not None and in_paths:
+                comp_a, comp_t = build_compensation_transform(eff[0], eff[1])
+                out_inverse_paths = _apply_affine_to_paths(in_paths, comp_a, comp_t)
+                out_forward_paths = _apply_affine_to_paths(in_paths, eff[0], eff[1])
                 distorted = _apply_affine_to_paths(in_paths, eff[0], eff[1])
             dlg = self._dxf_compare_dialog
             if dlg is None and show_dialog:
                 dlg = DxfCompareDialog(self)
                 self._dxf_compare_dialog = dlg
             if dlg is not None:
-                dlg.set_data(in_paths, out_paths, distorted, input_entities=entities)
+                dlg.set_data(
+                    in_paths,
+                    out_inverse_paths,
+                    out_forward_paths,
+                    distorted,
+                    input_entities=entities,
+                )
                 if show_dialog:
                     dlg.refresh()
                     dlg.showMaximized()
@@ -3881,6 +3919,21 @@ class MainWindow(QMainWindow):
 
     def on_dxf_preview_clicked(self) -> None:
         self._apply_dxf_compare_data(show_dialog=True)
+
+    def _sync_dxf_process_button_mode(self) -> None:
+        if self._dxf_process_use_inverse:
+            self.btn_inverse_dxf.setText("Process/Inverse")
+            self._act_dxf_toggle_mode.setText("Forward")
+        else:
+            self.btn_inverse_dxf.setText("Process/Forward")
+            self._act_dxf_toggle_mode.setText("Inverse")
+
+    def _on_toggle_dxf_process_mode(self) -> None:
+        self._dxf_process_use_inverse = not self._dxf_process_use_inverse
+        self._sync_dxf_process_button_mode()
+
+    def on_dxf_process_armed(self) -> None:
+        self._run_dxf_export(use_inverse=self._dxf_process_use_inverse)
 
     def on_browse_input_dxf(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Input DXF", "", "DXF Files (*.dxf)")

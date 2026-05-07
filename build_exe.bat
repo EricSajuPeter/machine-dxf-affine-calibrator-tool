@@ -6,6 +6,10 @@ REM ============================================================================
 REM  AffineCalibratorGUI — Windows build (PyInstaller one-file EXE)
 REM  Run from Explorer or cmd; creates .venv if missing, installs deps, builds.
 REM
+REM  Changelog (latest):
+REM    - Fixed overlay DXF coordinate preview rendering in the preview dialog.
+REM    - Added armed Process/Inverse <-> Process/Forward split-button behavior.
+REM
 REM  Optional environment variables:
 REM    SKIP_INSTALL=1     Skip pip install (use after deps already installed)
 REM    PIP_UPGRADE=1      Pass --upgrade when installing requirements.txt
