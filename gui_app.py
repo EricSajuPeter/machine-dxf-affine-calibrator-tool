@@ -931,14 +931,14 @@ class DxfCompareDialog(QDialog):
         self._btn_overlay_clear = QPushButton("Clear overlays")
         self._btn_overlay_add.clicked.connect(self._on_add_overlay_dxf)
         self._btn_overlay_clear.clicked.connect(self._on_clear_overlay_dxf)
-        self._rad_overlay_forward = QRadioButton("Forward error")
-        self._rad_overlay_inverse = QRadioButton("Inverse error")
+        self._rad_overlay_forward = QRadioButton("Preview forward error")
+        self._rad_overlay_inverse = QRadioButton("Preview inverse error")
         self._rad_overlay_forward.setChecked(True)
         self._overlay_tf_group = QButtonGroup(self)
         self._overlay_tf_group.setExclusive(True)
         self._overlay_tf_group.addButton(self._rad_overlay_forward, 0)
         self._overlay_tf_group.addButton(self._rad_overlay_inverse, 1)
-        self._overlay_tf_group.idClicked.connect(lambda _i: self.refresh(preserve_view=True))
+        self._overlay_tf_group.idClicked.connect(self._on_overlay_error_mode_clicked)
         self._lbl_overlay_target = QLabel("Apply preview affine error to:")
         self._rad_overlay_target_none = QRadioButton("None")
         self._rad_overlay_target_overlay = QRadioButton("Overlay only")
@@ -1222,6 +1222,7 @@ class DxfCompareDialog(QDialog):
         self._output_paths = (
             self._output_inverse_paths if self._output_mode_inverse else self._output_forward_paths
         )
+        self._sync_overlay_error_mode_from_output_mode(self._output_mode_inverse)
         self.refresh(preserve_view=True)
 
     def _update_overlay_label(self) -> None:
@@ -1380,6 +1381,18 @@ class DxfCompareDialog(QDialog):
         self._overlay_preview_layers.clear()
         self._update_overlay_label()
         self.refresh(preserve_view=True)
+
+    def _on_overlay_error_mode_clicked(self, _id: int) -> None:
+        self.refresh(preserve_view=True)
+
+    def _sync_overlay_error_mode_from_output_mode(self, output_mode_inverse: bool) -> None:
+        # Coupled mapping:
+        #   Output armed Inverse -> Preview forward error checked.
+        #   Output armed Forward -> Preview inverse error checked.
+        if output_mode_inverse:
+            self._rad_overlay_forward.setChecked(True)
+        else:
+            self._rad_overlay_inverse.setChecked(True)
 
     def _get_layer_paths(self, layer_name: str) -> List[np.ndarray]:
         if layer_name == "Input":
@@ -1993,6 +2006,7 @@ class DxfCompareDialog(QDialog):
         *,
         input_entities: Optional[List[DxfPlottedEntity]] = None,
     ) -> None:
+        self._sync_overlay_error_mode_from_output_mode(self._output_mode_inverse)
         self._input_paths = input_paths
         self._output_inverse_paths = output_inverse_paths
         self._output_forward_paths = output_forward_paths
@@ -4065,6 +4079,11 @@ class MainWindow(QMainWindow):
     def _on_toggle_dxf_process_mode(self) -> None:
         self._dxf_process_use_inverse = not self._dxf_process_use_inverse
         self._sync_dxf_process_button_mode()
+        dlg = self._dxf_compare_dialog
+        if dlg is not None:
+            dlg._sync_overlay_error_mode_from_output_mode(self._dxf_process_use_inverse)
+            if dlg.isVisible():
+                dlg.refresh(preserve_view=True)
 
     def on_dxf_process_armed(self) -> None:
         self._run_dxf_export(use_inverse=self._dxf_process_use_inverse)
