@@ -7,6 +7,9 @@ REM  AffineCalibratorGUI — Windows build (PyInstaller one-file EXE)
 REM  Run from Explorer or cmd; creates .venv if missing, installs deps, builds.
 REM
 REM  Changelog (latest):
+REM    - Added preview affine error target scope: None / Overlay only / All layers (except overlay).
+REM    - Applied swapped preview affine mapping only to Overlay scope; main layers use normal mapping.
+REM    - Coordinates in preview now follow the displayed transformed graph consistently across layers.
 REM    - Fixed overlay DXF coordinate preview rendering in the preview dialog.
 REM    - Added armed Process/Inverse <-> Process/Forward split-button behavior.
 REM

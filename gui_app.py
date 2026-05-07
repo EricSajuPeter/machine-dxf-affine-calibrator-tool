@@ -939,9 +939,24 @@ class DxfCompareDialog(QDialog):
         self._overlay_tf_group.addButton(self._rad_overlay_forward, 0)
         self._overlay_tf_group.addButton(self._rad_overlay_inverse, 1)
         self._overlay_tf_group.idClicked.connect(lambda _i: self.refresh(preserve_view=True))
+        self._lbl_overlay_target = QLabel("Apply preview affine error to:")
+        self._rad_overlay_target_none = QRadioButton("None")
+        self._rad_overlay_target_overlay = QRadioButton("Overlay only")
+        self._rad_overlay_target_input = QRadioButton("All layers (except overlay)")
+        self._rad_overlay_target_none.setChecked(True)
+        self._overlay_target_group = QButtonGroup(self)
+        self._overlay_target_group.setExclusive(True)
+        self._overlay_target_group.addButton(self._rad_overlay_target_none, 0)
+        self._overlay_target_group.addButton(self._rad_overlay_target_overlay, 1)
+        self._overlay_target_group.addButton(self._rad_overlay_target_input, 2)
+        self._overlay_target_group.idClicked.connect(lambda _i: self.refresh(preserve_view=True))
         overlay_l.addWidget(self._lbl_overlay_count)
         overlay_l.addWidget(self._rad_overlay_forward)
         overlay_l.addWidget(self._rad_overlay_inverse)
+        overlay_l.addWidget(self._lbl_overlay_target)
+        overlay_l.addWidget(self._rad_overlay_target_none)
+        overlay_l.addWidget(self._rad_overlay_target_overlay)
+        overlay_l.addWidget(self._rad_overlay_target_input)
         overlay_l.addWidget(self._btn_overlay_add)
         overlay_l.addWidget(self._btn_overlay_clear)
         sec_overlay = _CollapsibleSection("Overlay DXFs (preview only)", overlay_inner, start_open=False)
@@ -1122,6 +1137,10 @@ class DxfCompareDialog(QDialog):
             self._btn_output_mode.setEnabled(False)
             self._rad_overlay_forward.setEnabled(False)
             self._rad_overlay_inverse.setEnabled(False)
+            self._lbl_overlay_target.setEnabled(False)
+            self._rad_overlay_target_none.setEnabled(False)
+            self._rad_overlay_target_overlay.setEnabled(False)
+            self._rad_overlay_target_input.setEnabled(False)
             self._btn_overlay_add.setEnabled(False)
             self._btn_overlay_clear.setEnabled(False)
             right_l.addWidget(QLabel(f"Plot unavailable: {exc}"))
@@ -1257,6 +1276,82 @@ class DxfCompareDialog(QDialog):
             self._main._log("[DXF overlay] TPS warp unavailable; using affine-only overlay preview.")
             self._overlay_warp_warned_sig = sig
         return model
+
+    def _build_preview_error_transform(
+        self,
+        *,
+        swapped_mode: bool,
+    ) -> Tuple[Optional[Tuple[np.ndarray, np.ndarray]], Optional[TpsWarpModel], bool, Optional[str]]:
+        eff = self._main.get_effective_forward_affine()
+        if swapped_mode:
+            apply_inverse = self._rad_overlay_forward.isChecked()
+        else:
+            apply_inverse = self._rad_overlay_inverse.isChecked()
+        if eff is None:
+            return None, None, apply_inverse, None
+        warp_sig = self._overlay_warp_signature()
+        tps_model = self._overlay_warp_model()
+        if apply_inverse:
+            tf = build_compensation_transform(eff[0], eff[1])
+        else:
+            tf = (np.asarray(eff[0], dtype=float), np.asarray(eff[1], dtype=float))
+        return tf, tps_model, apply_inverse, warp_sig
+
+    def _apply_preview_error_to_paths(
+        self,
+        paths: List[np.ndarray],
+        *,
+        tf: Tuple[np.ndarray, np.ndarray],
+        tps_model: Optional[TpsWarpModel],
+        apply_inverse: bool,
+        warp_sig: Optional[str],
+    ) -> List[np.ndarray]:
+        eff = self._main.get_effective_forward_affine()
+        if eff is None:
+            return [np.asarray(arr, dtype=float) for arr in paths]
+        out: List[np.ndarray] = []
+        for arr in paths:
+            arr_np = np.asarray(arr, dtype=float)
+            if arr_np.shape[0] < 1:
+                out.append(arr_np)
+                continue
+            if apply_inverse:
+                if tps_model is None:
+                    a_tf, t_tf = tf
+                    out.append((a_tf @ arr_np.T).T + t_tf)
+                else:
+                    x_inv, ok = apply_affine_plus_tps_inverse(
+                        arr_np,
+                        np.asarray(eff[0], dtype=float),
+                        np.asarray(eff[1], dtype=float),
+                        tps_model,
+                    )
+                    if not np.all(ok):
+                        a_tf, t_tf = tf
+                        aff_inv = (a_tf @ arr_np.T).T + t_tf
+                        x_inv = np.asarray(x_inv, dtype=float)
+                        x_inv[~ok] = aff_inv[~ok]
+                        if warp_sig is not None and self._overlay_warp_warned_sig != f"{warp_sig}:inv":
+                            n_bad = int((~ok).sum())
+                            self._main._log(
+                                f"[DXF overlay] TPS inverse fallback to affine-only on {n_bad} point(s)."
+                            )
+                            self._overlay_warp_warned_sig = f"{warp_sig}:inv"
+                    out.append(x_inv)
+            else:
+                if tps_model is None:
+                    a_tf, t_tf = tf
+                    out.append((a_tf @ arr_np.T).T + t_tf)
+                else:
+                    out.append(
+                        apply_affine_plus_tps_forward(
+                            arr_np,
+                            np.asarray(eff[0], dtype=float),
+                            np.asarray(eff[1], dtype=float),
+                            tps_model,
+                        )
+                    )
+        return out
 
     def _on_add_overlay_dxf(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(self, "Add overlay DXF(s)", "", "DXF Files (*.dxf)")
@@ -1417,12 +1512,15 @@ class DxfCompareDialog(QDialog):
             return None
         return best
 
-    def _draw_input_entities(self, ax: object) -> bool:
+    def _draw_input_entities(self, ax: object, path_override: Optional[List[np.ndarray]] = None) -> bool:
         sel: Set[str] = self._main._dxf_selected_handles
         drawn = False
         first = True
-        for ent in self._input_entities:
-            arr = ent.path
+        for idx, ent in enumerate(self._input_entities):
+            if path_override is not None and idx < len(path_override):
+                arr = path_override[idx]
+            else:
+                arr = ent.path
             if arr.shape[0] < 2:
                 continue
             is_sel = ent.handle in sel
@@ -1440,10 +1538,15 @@ class DxfCompareDialog(QDialog):
             drawn = True
         return drawn
 
-    def _collect_pickables_from_entities(self, entities: List[DxfPlottedEntity]) -> List[Dict[str, Any]]:
+    def _collect_pickables_from_entities(
+        self, entities: List[DxfPlottedEntity], path_override: Optional[List[np.ndarray]] = None
+    ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for e_idx, ent in enumerate(entities):
-            arr = ent.path
+            if path_override is not None and e_idx < len(path_override):
+                arr = path_override[e_idx]
+            else:
+                arr = ent.path
             for i, row in enumerate(arr):
                 out.append(
                     {
@@ -1934,93 +2037,124 @@ class DxfCompareDialog(QDialog):
         ax.set_ylabel("Y")
         any_drawn = False
         pickables: List[Dict[str, Any]] = []
+        apply_to_none = self._rad_overlay_target_none.isChecked()
+        apply_to_overlay = self._rad_overlay_target_overlay.isChecked()
+        apply_to_main_layers = self._rad_overlay_target_input.isChecked()
+        if apply_to_none:
+            main_tf, main_tps_model, main_apply_inverse, main_warp_sig = (None, None, False, None)
+            overlay_tf_mode, overlay_tps_model_mode, overlay_apply_inverse_mode, overlay_warp_sig_mode = (
+                None,
+                None,
+                False,
+                None,
+            )
+        else:
+            main_tf, main_tps_model, main_apply_inverse, main_warp_sig = (
+                self._build_preview_error_transform(swapped_mode=False)
+            )
+            overlay_tf_mode, overlay_tps_model_mode, overlay_apply_inverse_mode, overlay_warp_sig_mode = (
+                self._build_preview_error_transform(swapped_mode=True)
+            )
 
         if self._chk_input.isChecked():
             if self._input_entities:
-                any_drawn = self._draw_input_entities(ax) or any_drawn
-                pickables.extend(self._collect_pickables_from_entities(self._input_entities))
+                input_entity_paths_override: Optional[List[np.ndarray]] = None
+                if apply_to_main_layers and main_tf is not None:
+                    input_entity_paths_override = self._apply_preview_error_to_paths(
+                        [ent.path for ent in self._input_entities],
+                        tf=main_tf,
+                        tps_model=main_tps_model,
+                        apply_inverse=main_apply_inverse,
+                        warp_sig=main_warp_sig,
+                    )
+                any_drawn = self._draw_input_entities(ax, path_override=input_entity_paths_override) or any_drawn
+                pickables.extend(
+                    self._collect_pickables_from_entities(
+                        self._input_entities, path_override=input_entity_paths_override
+                    )
+                )
                 if self._chk_coords.isChecked():
                     pts: List[Tuple[float, float]] = []
-                    for ent in self._input_entities:
-                        for row in ent.path:
+                    for idx, ent in enumerate(self._input_entities):
+                        if input_entity_paths_override is not None and idx < len(input_entity_paths_override):
+                            ent_path = input_entity_paths_override[idx]
+                        else:
+                            ent_path = ent.path
+                        for row in ent_path:
                             pts.append((float(row[0]), float(row[1])))
                     self._annotate_points(ax, pts, color="blue", prefix="In")
             else:
-                any_drawn = self._draw_paths(ax, self._input_paths, color="blue", label="Input DXF") or any_drawn
-                pickables.extend(self._collect_pickables(self._input_paths, source="Input"))
+                input_paths = self._input_paths
+                if apply_to_main_layers and main_tf is not None:
+                    input_paths = self._apply_preview_error_to_paths(
+                        input_paths,
+                        tf=main_tf,
+                        tps_model=main_tps_model,
+                        apply_inverse=main_apply_inverse,
+                        warp_sig=main_warp_sig,
+                    )
+                any_drawn = self._draw_paths(ax, input_paths, color="blue", label="Input DXF") or any_drawn
+                pickables.extend(self._collect_pickables(input_paths, source="Input"))
                 if self._chk_coords.isChecked():
-                    pts = [item["point"] for item in self._collect_pickables(self._input_paths, source="Input")]
+                    pts = [item["point"] for item in self._collect_pickables(input_paths, source="Input")]
                     self._annotate_points(ax, pts, color="blue", prefix="In")
         if self._chk_output.isChecked():
-            any_drawn = self._draw_paths(ax, self._output_paths, color="green", label="Output DXF") or any_drawn
-            pickables.extend(self._collect_pickables(self._output_paths, source="Output"))
+            output_paths = self._output_paths
+            if apply_to_main_layers and main_tf is not None:
+                output_paths = self._apply_preview_error_to_paths(
+                    output_paths,
+                    tf=main_tf,
+                    tps_model=main_tps_model,
+                    apply_inverse=main_apply_inverse,
+                    warp_sig=main_warp_sig,
+                )
+            any_drawn = self._draw_paths(ax, output_paths, color="green", label="Output DXF") or any_drawn
+            pickables.extend(self._collect_pickables(output_paths, source="Output"))
             if self._chk_coords.isChecked():
-                pts = [item["point"] for item in self._collect_pickables(self._output_paths, source="Output")]
+                pts = [item["point"] for item in self._collect_pickables(output_paths, source="Output")]
                 self._annotate_points(ax, pts, color="green", prefix="Out")
         if self._chk_distorted.isChecked():
+            distorted_paths = self._distorted_paths
+            if apply_to_main_layers and main_tf is not None:
+                distorted_paths = self._apply_preview_error_to_paths(
+                    distorted_paths,
+                    tf=main_tf,
+                    tps_model=main_tps_model,
+                    apply_inverse=main_apply_inverse,
+                    warp_sig=main_warp_sig,
+                )
             any_drawn = (
                 self._draw_paths(
-                    ax, self._distorted_paths, color="purple", label="Distorted"
+                    ax, distorted_paths, color="purple", label="Distorted"
                 )
                 or any_drawn
             )
-            pickables.extend(self._collect_pickables(self._distorted_paths, source="Distorted"))
+            pickables.extend(self._collect_pickables(distorted_paths, source="Distorted"))
             if self._chk_coords.isChecked():
-                pts = [item["point"] for item in self._collect_pickables(self._distorted_paths, source="Distorted")]
+                pts = [item["point"] for item in self._collect_pickables(distorted_paths, source="Distorted")]
                 self._annotate_points(ax, pts, color="purple", prefix="Distorted")
         if self._chk_overlay.isChecked() and self._overlay_preview_layers:
-            eff = self._main.get_effective_forward_affine()
             overlay_tf: Optional[Tuple[np.ndarray, np.ndarray]] = None
             tps_model: Optional[TpsWarpModel] = None
-            warp_sig = self._overlay_warp_signature()
-            apply_inverse = self._rad_overlay_forward.isChecked()
-            if eff is not None:
-                tps_model = self._overlay_warp_model()
-                if apply_inverse:
-                    overlay_tf = build_compensation_transform(eff[0], eff[1])
-                else:
-                    overlay_tf = (np.asarray(eff[0], dtype=float), np.asarray(eff[1], dtype=float))
+            warp_sig = overlay_warp_sig_mode
+            apply_inverse = overlay_apply_inverse_mode
+            if apply_to_overlay and overlay_tf_mode is not None:
+                overlay_tf = overlay_tf_mode
+                tps_model = overlay_tps_model_mode
             first_overlay = True
             for _name, paths in self._overlay_preview_layers:
-                for arr in paths:
-                    if arr.shape[0] < 2:
+                plot_paths = paths
+                if overlay_tf is not None:
+                    plot_paths = self._apply_preview_error_to_paths(
+                        paths,
+                        tf=overlay_tf,
+                        tps_model=tps_model,
+                        apply_inverse=apply_inverse,
+                        warp_sig=warp_sig,
+                    )
+                for idx, plot_arr in enumerate(plot_paths):
+                    if plot_arr.shape[0] < 2:
                         continue
-                    plot_arr = arr
-                    if overlay_tf is not None:
-                        if apply_inverse:
-                            if tps_model is None:
-                                a_tf, t_tf = overlay_tf
-                                plot_arr = (a_tf @ arr.T).T + t_tf
-                            else:
-                                x_inv, ok = apply_affine_plus_tps_inverse(
-                                    arr,
-                                    np.asarray(eff[0], dtype=float),
-                                    np.asarray(eff[1], dtype=float),
-                                    tps_model,
-                                )
-                                if not np.all(ok):
-                                    a_tf, t_tf = overlay_tf
-                                    aff_inv = (a_tf @ arr.T).T + t_tf
-                                    x_inv = np.asarray(x_inv, dtype=float)
-                                    x_inv[~ok] = aff_inv[~ok]
-                                    if warp_sig is not None and self._overlay_warp_warned_sig != f"{warp_sig}:inv":
-                                        n_bad = int((~ok).sum())
-                                        self._main._log(
-                                            f"[DXF overlay] TPS inverse fallback to affine-only on {n_bad} point(s)."
-                                        )
-                                        self._overlay_warp_warned_sig = f"{warp_sig}:inv"
-                                plot_arr = x_inv
-                        else:
-                            if tps_model is None:
-                                a_tf, t_tf = overlay_tf
-                                plot_arr = (a_tf @ arr.T).T + t_tf
-                            else:
-                                plot_arr = apply_affine_plus_tps_forward(
-                                    arr,
-                                    np.asarray(eff[0], dtype=float),
-                                    np.asarray(eff[1], dtype=float),
-                                    tps_model,
-                                )
                     ax.plot(
                         plot_arr[:, 0],
                         plot_arr[:, 1],
