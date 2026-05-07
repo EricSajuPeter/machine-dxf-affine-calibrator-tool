@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QDoubleValidator
+from PySide6.QtGui import QDesktopServices, QDoubleValidator, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -61,6 +61,12 @@ from affine_core import (
 )
 
 Point = Tuple[float, float]
+
+
+def _resource_path(rel_path: str) -> Path:
+    # Support both source runs and PyInstaller one-file bundles.
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / rel_path
 
 
 def _dist_point_to_segment_sq(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
@@ -4271,8 +4277,27 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AffineCalibratorGUI")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    icon = QIcon()
+    for rel in ("assets/app_icon.ico", "assets/app_icon.png"):
+        p = _resource_path(rel)
+        if p.exists():
+            cand = QIcon(str(p))
+            if not cand.isNull():
+                icon = cand
+                break
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     window = MainWindow()
+    if not icon.isNull():
+        window.setWindowIcon(icon)
     window.show()
     sys.exit(app.exec())
 

@@ -7,6 +7,9 @@ REM  AffineCalibratorGUI — Windows build (PyInstaller one-file EXE)
 REM  Run from Explorer or cmd; creates .venv if missing, installs deps, builds.
 REM
 REM  Changelog (latest):
+REM    - Embedded app icon assets into the EXE bundle and improved runtime taskbar icon reliability on Windows.
+REM    - Build now requires icon asset in assets folder and auto-generates app_icon.ico from app_icon.png when needed.
+REM    - Added optional EXE icon support via assets\app_icon.ico in the PyInstaller spec.
 REM    - Renamed overlay controls to Preview forward/inverse error.
 REM    - Coupled overlay preview-error auto-selection to Output DXF Inverse/Forward mode changes.
 REM    - Added preview affine error target scope: None / Overlay only / All layers (except overlay).
@@ -51,6 +54,10 @@ if not exist "requirements.txt" (
 )
 if not exist "%SPEC_FILE%" (
   echo [ERROR] Spec file not found: %SPEC_FILE%
+  exit /b 1
+)
+if not exist "assets\app_icon.ico" if not exist "assets\app_icon.png" (
+  echo [ERROR] App icon missing. Add assets\app_icon.ico or assets\app_icon.png
   exit /b 1
 )
 
@@ -124,6 +131,25 @@ if /i "%SKIP_INSTALL%"=="1" (
     echo [ERROR] Dependency install failed.
     exit /b 1
   )
+)
+echo.
+
+REM --- Icon prep (EXE + runtime) ---
+if not exist "assets\app_icon.ico" (
+  if exist "assets\app_icon.png" (
+    echo [INFO] Generating assets\app_icon.ico from assets\app_icon.png ...
+    "%VENV_PY%" -c "from PySide6.QtGui import QImage; import sys; img=QImage(r'assets/app_icon.png'); ok=(not img.isNull()) and img.save(r'assets/app_icon.ico'); sys.exit(0 if ok else 1)"
+    if errorlevel 1 (
+      echo [ERROR] Failed to generate assets\app_icon.ico from PNG.
+      exit /b 1
+    )
+  )
+)
+if exist "assets\app_icon.ico" (
+  echo [INFO] EXE icon: assets\app_icon.ico
+) else (
+  echo [ERROR] Icon preparation failed; assets\app_icon.ico not found.
+  exit /b 1
 )
 echo.
 
